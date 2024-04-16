@@ -1,0 +1,15 @@
+[package]
+name = "brc-rs"
+version = "0.1.0"
+edition = "2021"
+default-run = "brc-rs"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "create_measurements"
+required-features = ["generate"]
+[dependencies]
+rand = { version = "0.8.5", optional = true }
+rand_distr = { version = "0.4.3", optional = true }
+
+[features]
+generate = ["rand", "rand_distr"]
