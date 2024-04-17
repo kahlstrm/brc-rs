@@ -3,6 +3,8 @@ use rand_distr::Normal;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 struct WeatherStation {
@@ -20,7 +22,6 @@ impl WeatherStation {
 }
 
 fn main() -> std::io::Result<()> {
-    let start = Instant::now();
     let mut args = std::env::args();
     let Some(size) = args.nth(1) else {
         eprintln!("Usage: create_measurements <number of records to create>");
@@ -34,26 +35,81 @@ fn main() -> std::io::Result<()> {
     let file_name = args.next();
     let path = Path::new(file_name.as_deref().unwrap_or("measurements.txt"));
     let file = File::create(&path)?;
-    let mut writer = BufWriter::new(file);
-    for i in 0..size {
-        if i > 0 && i % 50_000_000 == 0 {
-            println!(
-                "Wrote {:} measurements in {} ms",
-                i,
-                start.elapsed().as_millis()
-            );
-        }
-        let station = &STATIONS[thread_rng().gen_range(0..STATIONS.len())];
-        writeln!(writer, "{};{}", station.id, station.measurement())?;
-    }
+    let writer = BufWriter::new(file);
+    generate_measurements(size, Arc::new(Mutex::new(writer)))?;
+    Ok(())
+}
 
+fn generate_measurements<W: Write + Send + 'static>(
+    size: usize,
+    writer: Arc<Mutex<W>>,
+) -> std::io::Result<()> {
+    let start = Instant::now();
+    let par_count = std::thread::available_parallelism().unwrap();
+    let task_size = size / par_count;
+    let mut tasks = vec![task_size; par_count.into()];
+    for i in 0..(size % par_count) {
+        tasks[i] += 1;
+    }
+    let tasks = tasks
+        .into_iter()
+        .map(|c| (c, writer.clone()))
+        .map(|(count, a_m)| thread::spawn(move || create_measurements(count, a_m)))
+        .collect::<Vec<_>>();
+    tasks.into_iter().for_each(|t| t.join().unwrap().unwrap());
     println!(
         "Created file with {} measurements in {} ms",
         size,
         start.elapsed().as_millis()
     );
-
     Ok(())
+}
+
+const TMP_VEC_CAPACITY: usize = 50_000;
+fn create_measurements<W: Write + Send>(
+    count: usize,
+    write_mutex: Arc<Mutex<W>>,
+) -> std::io::Result<()> {
+    let mut tmp_res = Vec::with_capacity(TMP_VEC_CAPACITY);
+    let mut tmp_line = Vec::with_capacity(106);
+
+    for _ in 0..count {
+        let station = &STATIONS[thread_rng().gen_range(0..STATIONS.len())];
+
+        writeln!(tmp_line, "{};{}", station.id, station.measurement())?;
+        if tmp_line.len() + tmp_res.len() > TMP_VEC_CAPACITY {
+            write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
+            tmp_res.clear();
+        }
+        tmp_res.write(&tmp_line)?;
+        tmp_line.clear();
+    }
+    write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::generate_measurements;
+
+    #[test]
+    fn generate_10k() {
+        let thing = Arc::new(Mutex::new(Vec::new()));
+        generate_measurements(10_000, thing.clone()).unwrap();
+        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
+            .expect("should be valid utf-8");
+        assert_eq!(res.lines().count(), 10_000)
+    }
+    #[test]
+    fn generate_random() {
+        let thing = Arc::new(Mutex::new(Vec::new()));
+        generate_measurements(77_123, thing.clone()).unwrap();
+        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
+            .expect("should be valid utf-8");
+        assert_eq!(res.lines().count(), 77_123)
+    }
 }
 macro_rules! ws {
     ($id:expr,$measurement:expr) => {
