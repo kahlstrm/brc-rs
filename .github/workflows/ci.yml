@@ -2,6 +2,10 @@ name: Cargo Build, Test and Bench
 
 on:
   push:
+    paths-ignore:
+      - "*.md"
+      - ".gitignore"
+
   pull_request:
 
 env:
