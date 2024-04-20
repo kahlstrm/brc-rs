@@ -76,7 +76,7 @@ fn create_measurements<W: Write + Send>(
     for _ in 0..count {
         let station = &STATIONS[thread_rng().gen_range(0..STATIONS.len())];
 
-        writeln!(tmp_line, "{};{}", station.id, station.measurement())?;
+        writeln!(tmp_line, "{};{:.1}", station.id, station.measurement())?;
         if tmp_line.len() + tmp_res.len() > TMP_VEC_CAPACITY {
             write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
             tmp_res.clear();
