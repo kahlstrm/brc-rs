@@ -28,11 +28,7 @@ fn parse_line(mut line: String) -> (String, f64) {
     (line, measurement)
 }
 fn calc(file_name: Option<String>) -> String {
-    let f = File::open(format!(
-        "{}.txt",
-        file_name.as_deref().unwrap_or("measurements")
-    ))
-    .unwrap();
+    let f = File::open(file_name.as_deref().unwrap_or("measurements.txt")).unwrap();
     let reader = BufReader::new(f);
     let lines = reader.lines();
     let mut res = lines
@@ -88,7 +84,7 @@ mod tests {
             fn $func() {
                 println!($file_name);
                 let res = read_to_string(format!("{}.out", $file_name)).unwrap();
-                assert_eq!(calc(Some($file_name.into())), res)
+                assert_eq!(calc(Some(format!("{}.txt", $file_name))), res)
             }
         };
     }
