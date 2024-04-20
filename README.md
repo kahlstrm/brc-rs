@@ -77,22 +77,22 @@ Usage for creating a `measurements-1m.txt` with 1 million measurements
 ./profile.sh <file-name-without-extension>
 ```
 
-This script runs the program with profiling enabled using samply, and opens the profile in Firefox Profiler in browser after the program exits.
+This script runs the program with profiling enabled using samply, and opens the profile in Firefox Profiler in browser after the program exits. Default file name is `measurements`
 
-### Benchmarks
+### Benchmarking
 
 ```sh
 ./bench.sh <file-name-without-extension>
 ```
 
-This script uses hyperfine to measure an average run time of 10 runs, with no warmup.
+This script uses hyperfine to measure an average run time of 10 runs, with no warmup. Default file name is `measurements`
 
 **NOTE**: For profiling and benchmarking, it is recommended to generate a bigger input file to see measurable differences. see [Generating measurements](#generating-measurements)
 
 ## Optimization Results
 
 Here is a table for a quick summary of the current progress of the optimizations.
-All tests are run using a 10-core 14" Macbook M1 Max 32 GB
+Benchmarks and profiling results shown below are run against a `measurements.txt` generated with `./create_measurements.sh 1000000000`, having 1 billion entries using a 10-core 14" Macbook M1 Max 32 GB.
 
 | Optimization                                                    | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                   |
 | --------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | --------------------------------------------------------- |
