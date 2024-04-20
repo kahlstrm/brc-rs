@@ -17,8 +17,8 @@ struct WeatherStationStats {
     count: usize,
 }
 impl WeatherStationStats {
-    fn mean(&self) -> f32 {
-        (((self.sum) / (self.count as f64) * 10.0).ceil() / 10.0) as f32
+    fn mean(&self) -> f64 {
+        self.sum / self.count as f64
     }
 }
 fn parse_line(line: &str) -> (&str, f64) {
@@ -109,4 +109,5 @@ mod tests {
     tst!(measurements_rounding, "samples/measurements-rounding");
     tst!(measurements_short, "samples/measurements-short");
     tst!(measurements_shortest, "samples/measurements-shortest");
+    tst!(measurements_1m, "samples/measurements-1m");
 }

@@ -105,6 +105,8 @@ Nothing special really, just a quick version to get things going with a `HashMap
 
 Struggled too long with getting a correct implementation of the rounding calculation to pass the original test suite.
 
+Going forward, the rounding conventions will change, with the test files being generated with the initial version of this project with only the conversion logic changed.
+
 ```sh
 ~/src/github/brc-rs (master*) » ./bench.sh
 Benchmark 1: ./target/release/brc-rs
