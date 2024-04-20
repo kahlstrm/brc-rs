@@ -94,10 +94,11 @@ This script uses hyperfine to measure an average run time of 10 runs, with no wa
 Here is a table for a quick summary of the current progress of the optimizations.
 All tests are run using a 10-core 14" Macbook M1 Max 32 GB
 
-| Version                             | Time (mean ± σ): | Improvement | Notes                                                     |
-| ----------------------------------- | ---------------- | ----------- | --------------------------------------------------------- |
-| [Initial Version](#initial-version) | 149.403 ± 0.452  | N/A         | Naive single-core implementation with BufReader & HashMap |
-|                                     |                  |             |                                                           |
+| Optimization                                                    | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                   |
+| --------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | --------------------------------------------------------- |
+| [Initial Version](#initial-version)                             | 149.403 ± 0.452   | N/A                                                    | Naive single-core implementation with BufReader & HashMap |
+| [Unnecessary string allocation](#unnecessary-string-allocation) | 102.907 s ± 1.175 | <strong style="color:lime;"> -46,496 s (-31%)</strong> | Remove an unnecessary allocation of a string inside loop  |
+|                                                                 |                   |                                                        |                                                           |
 
 ### Initial Version
 
@@ -115,3 +116,26 @@ Benchmark 1: ./target/release/brc-rs
 ```
 
 ![Flame Graph of initial implementation](initial.png)
+
+Looking at the flame graph, we spend ~30% of the time in `<std::io::Lines as core::iter::traits::iterator::Iterator>::next`. That is, reading the file line by line. This most likely due to the use of [`BufRead::lines()`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.lines) for iterating the lines, as it creates a new `String` for each row, allocating memory. This allocation of each line separately creates unnecessary overhead, and probably should be looked into first.
+
+Inside the `calc`-function we also spend 13% of the time creating strings and 17% of the time dropping Strings, freeing the allocated memory. We spend 16% in actually parsing the line, and 22% doing hashmap operations.
+
+### Unnecessary string allocation
+
+Even though the profile indicates that looking into the reading of the file should probably be looked into first, during writing the previous analysis I realized that I made a totally unnecessary string allocation inside `calc`.
+
+As we receive a String from the iterator already and it isn't used in any other way than passed as a string slice to `parse_line`
+, we can instead pass it to `parse_line` and return the original line string but truncated to only contain the station name.
+By doing this, we can use that as the key for the hashmap instead of allocating a new string entirely for it.
+
+```sh
+~/src/github/brc-rs (main*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+  Time (mean ± σ):     102.907 s ±  1.175 s    [User: 98.842 s, System: 2.179 s]
+  Range (min … max):   101.440 s … 104.566 s    5 runs
+```
+
+This just goes to show that allocating another string unnecessarily with this amount of data has already a significant impact on performance.
+
+![Flame Graph after removing the string allocation](unnecessary-string-alloc.png)

@@ -21,9 +21,11 @@ impl WeatherStationStats {
         self.sum / self.count as f64
     }
 }
-fn parse_line(line: &str) -> (&str, f64) {
-    let (station, measurement) = line.split_once(";").unwrap();
-    (station, measurement.parse().unwrap())
+fn parse_line(mut line: String) -> (String, f64) {
+    let semicolon_idx = line.find(";").unwrap();
+    let measurement: f64 = (&line[semicolon_idx + 1..]).parse().unwrap();
+    line.truncate(semicolon_idx);
+    (line, measurement)
 }
 fn calc(file_name: Option<String>) -> String {
     let f = File::open(format!(
@@ -38,8 +40,8 @@ fn calc(file_name: Option<String>) -> String {
             HashMap::new(),
             |mut map: HashMap<String, WeatherStationStats>, line| {
                 let line = line.unwrap();
-                let (station, measurement) = parse_line(&line);
-                map.entry(station.to_string())
+                let (station, measurement) = parse_line(line);
+                map.entry(station)
                     .and_modify(|s| {
                         s.max = s.max.max(measurement);
                         s.min = s.min.min(measurement);
