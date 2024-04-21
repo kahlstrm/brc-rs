@@ -94,11 +94,11 @@ This script uses hyperfine to measure an average run time of 10 runs, with no wa
 Here is a table for a quick summary of the current progress of the optimizations.
 Benchmarks and profiling results shown below are run against a `measurements.txt` generated with `./create_measurements.sh 1000000000`, having 1 billion entries using a 10-core 14" Macbook M1 Max 32 GB.
 
-| Optimization                                                    | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                   |
-| --------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | --------------------------------------------------------- |
-| [Initial Version](#initial-version)                             | 149.403 ± 0.452   | N/A                                                    | Naive single-core implementation with BufReader & HashMap |
-| [Unnecessary string allocation](#unnecessary-string-allocation) | 102.907 s ± 1.175 | <strong style="color:lime;"> -46,496 s (-31%)</strong> | Remove an unnecessary allocation of a string inside loop  |
-|                                                                 |                   |                                                        |                                                           |
+| Optimization                                                                                  | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                                                                         |
+| --------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| [Initial Version](#initial-version)                                                           | 149.403 ± 0.452   | N/A                                                    | Naive single-core implementation with BufReader & HashMap                                                       |
+| [Unnecessary string allocation](#unnecessary-string-allocation)                               | 102.907 s ± 1.175 | <strong style="color:lime;"> -46,496 s (-31%)</strong> | Remove an unnecessary allocation of a string inside loop                                                        |
+| [Iterate over string slices instead of String](#iterate-over-string-slices-instead-of-string) | 63.493 s ± 1.368  | <strong style="color:lime;"> -39,414 s (-38%)</strong> | Read entire into memory first, iterate over string slices, move away from using Entry API for accessing hashmap |
 
 ### Initial Version
 
@@ -139,3 +139,110 @@ Benchmark 1: ./target/release/brc-rs
 This just goes to show that allocating another string unnecessarily with this amount of data has already a significant impact on performance.
 
 ![Flame Graph after removing the string allocation](unnecessary-string-alloc.png)
+
+### Iterate over string slices instead of String
+
+The reading of the file has grown to 44% time spent. This needs to be addressed.
+
+Let's first investigate the iterator performance with writing some test programs:
+
+```rust
+// test-bufread-lines.rs
+use std::io::BufRead;
+fn main() {
+    let now = std::time::Instant::now();
+    let f = std::fs::File::open("measurements.txt").unwrap();
+    let reader = std::io::BufReader::new(f);
+    let mut amount_read = 0;
+    for line in reader.lines() {
+        amount_read += line.unwrap().len() + 1; // add the newline character back
+    }
+    println!("reading {amount_read} bytes took {:#?}", now.elapsed());
+}
+```
+
+This program emulates the current implementations line iteration by using the [`BufRead::lines`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.lines)-function to iterate over each line.
+Note that the lines returned are all of type `String` underneath.
+
+```sh
+~/src/github/brc-rs (main*) » rustc -O test-bufread-lines.rs
+~/src/github/brc-rs (main*) » hyperfine ./test-bufread-lines
+Benchmark 1: ./test-bufread-lines
+  Time (mean ± σ):     55.872 s ±  0.080 s    [User: 53.816 s, System: 1.860 s]
+  Range (min … max):   55.764 s … 56.055 s    10 runs
+```
+
+So 55 seconds for iterating the file line by line? That seems kind of slow. Let's try to see if we can improve on that.
+
+Now let's look at the following program:
+
+```rust
+// test-read-to-string-lines.rs
+use std::io::Read;
+fn main() {
+    let now = std::time::Instant::now();
+    let f = std::fs::File::open("measurements.txt").unwrap();
+    let mut reader = std::io::BufReader::new(f);
+    let mut s = String::new();
+    reader.read_to_string(&mut s).unwrap();
+    let mut amount_read = 0;
+    for line in s.lines() {
+        amount_read += line.len() + 1; // add the newline character back
+    }
+    println!("reading {amount_read} bytes took {:#?}", now.elapsed());
+}
+```
+
+Instead of using `BufRead::lines`, here we first read the entire file into a `String` and then iterate over the lines with `str::lines`.
+
+```sh
+~/src/github/brc-rs (main*) » rustc -O test-read-to-string-lines.rs
+~/src/github/brc-rs (main*) » hyperfine ./test-read-to-string-lines
+Benchmark 1: ./test-read-to-string-lines
+  Time (mean ± σ):     19.514 s ±  0.793 s    [User: 15.472 s, System: 1.311 s]
+  Range (min … max):   18.939 s … 21.331 s    10 runs
+```
+
+Reading the entire string first into memory results in a staggering 66% performance improvement.
+The penalty coming from the `BufRead::lines`-iterator is that it allocates every line separately as a `String`.
+This means on each line iteration, we allocate (and also de-allocate) memory, which causes significant overhead.
+However, reading the entire file into a single String comes with a glaring drawback: the entire file will be stored in memory at once, so the memory footprint will be affected.
+
+```sh
+~/src/github/brc-rs (main*) » /usr/bin/time -l ./test-bufread-lines
+reading 13795898567 bytes took 56.876117291s
+         --- redacted ---
+         1114688  peak memory footprint
+```
+
+Peak memory footprint of ~1.1 MB when using the buffered reader.
+
+```sh
+~/src/github/brc-rs (main*) » /usr/bin/time -l ./test-read-to-string-lines
+reading 13795898567 bytes took 21.289027s
+          --- redacted ---
+         13803464960  peak memory footprint
+```
+
+The peak memory footprint is now on the neighbourhood of 13.8GB, so a roughly 10,000x increase over using the buffered reader.
+This isn't ideal and not the final solution I'd hope to achieve, but for now it's good enough (and allowed in the original rules, so 🤷).
+Further improvements will be done later on, but for that we need to look at other parts to refactor until we can get back to this.
+
+Now that we iterate over string slices instead of strings, we need to revert our `parse_line` to its previous state.
+Another problem arises with the [`HashMap::entry()`](https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.entry) access method into the hashmap.
+The function requires passing the key by value instead of reference, meaning we would need to allocate a new string for the station name on each iteration.
+This would result as going back to allocating on each iteration, removing the optimization.
+[The Entry API in the standard library doesn't seem to work with expensive keys](https://stackoverflow.com/questions/51542024/how-do-i-use-the-entry-api-with-an-expensive-key-that-is-only-constructed-if-the/56921965#56921965)
+
+Let's instead use [`HashMap::get_mut()`](https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.get_mut) with a `match`, either modifying the value or inserting a new one.
+Here we limit the allocations to only occur on the inserts, and `get_mut()` happily takes a string slice as argument.
+
+```sh
+~/src/github/brc-rs (main*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+  Time (mean ± σ):     63.493 s ±  1.368 s    [User: 58.224 s, System: 2.112 s]
+  Range (min … max):   62.183 s … 65.675 s    5 runs
+```
+
+![Flamegraph of the program after implementing iterating over slices instead of String](iterate-over-slices.png)
+

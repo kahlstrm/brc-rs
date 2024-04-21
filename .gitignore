@@ -2,3 +2,5 @@
 measurements.txt
 measurements.out
 profile.json
+test*
+!test*.rs

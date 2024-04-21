@@ -21,40 +21,18 @@ impl WeatherStationStats {
         self.sum / self.count as f64
     }
 }
-fn parse_line(mut line: String) -> (String, f64) {
+fn parse_line(line: &str) -> (&str, f64) {
     let semicolon_idx = line.find(";").unwrap();
     let measurement: f64 = (&line[semicolon_idx + 1..]).parse().unwrap();
-    line.truncate(semicolon_idx);
-    (line, measurement)
+    (&line[..semicolon_idx], measurement)
 }
+
 fn calc(file_name: Option<String>) -> String {
     let f = File::open(file_name.as_deref().unwrap_or("measurements.txt")).unwrap();
     let reader = BufReader::new(f);
-    let lines = reader.lines();
-    let mut res = lines
-        .fold(
-            HashMap::new(),
-            |mut map: HashMap<String, WeatherStationStats>, line| {
-                let line = line.unwrap();
-                let (station, measurement) = parse_line(line);
-                map.entry(station)
-                    .and_modify(|s| {
-                        s.max = s.max.max(measurement);
-                        s.min = s.min.min(measurement);
-                        s.count += 1;
-                        s.sum += measurement;
-                    })
-                    .or_insert(WeatherStationStats {
-                        min: measurement,
-                        max: measurement,
-                        sum: measurement,
-                        count: 1,
-                    });
-                map
-            },
-        )
-        .into_iter()
-        .collect::<Vec<_>>();
+    let stations = aggregate_measurements(reader);
+
+    let mut res = stations.into_iter().collect::<Vec<_>>();
     res.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     String::from("{")
         + &res
@@ -71,6 +49,38 @@ fn calc(file_name: Option<String>) -> String {
             .collect::<Vec<_>>()
             .join(", ")
         + &String::from("}\n")
+}
+
+fn aggregate_measurements(mut reader: impl BufRead) -> HashMap<String, WeatherStationStats> {
+    let mut stations: HashMap<String, WeatherStationStats> = HashMap::new();
+
+    // TODO: create an iterator out of the chunked reader logic, requires some lifetime magic
+    let mut kontsa = String::new();
+
+    reader.read_to_string(&mut kontsa).unwrap();
+    kontsa.lines().for_each(|line| {
+        let (station, measurement) = parse_line(line);
+        match stations.get_mut(station) {
+            None => {
+                stations.insert(
+                    station.to_string(),
+                    WeatherStationStats {
+                        min: measurement,
+                        max: measurement,
+                        sum: measurement,
+                        count: 1,
+                    },
+                );
+            }
+            Some(s) => {
+                s.max = s.max.max(measurement);
+                s.min = s.min.min(measurement);
+                s.count += 1;
+                s.sum += measurement;
+            }
+        };
+    });
+    stations
 }
 
 #[cfg(test)]
