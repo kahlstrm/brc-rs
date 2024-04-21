@@ -22,7 +22,10 @@ impl WeatherStationStats {
     }
 }
 fn parse_line(line: &str) -> (&str, f64) {
-    let semicolon_idx = line.find(";").unwrap();
+    // we know that the measurement is pure ASCII and is at max 5 characters long
+    // based on this we can find the semicolon faster by doing at most 6 byte comparisons by iterating the reversed bytes
+    // The resulting number is the 1-based index of the semicolon, hence the -1 in the end
+    let semicolon_idx = line.len() - line.bytes().rev().position(|b| b == b';').unwrap() - 1;
     let measurement: f64 = (&line[semicolon_idx + 1..]).parse().unwrap();
     (&line[..semicolon_idx], measurement)
 }
@@ -88,6 +91,41 @@ mod tests {
     use std::fs::read_to_string;
 
     use crate::calc;
+    use crate::parse_line;
+    macro_rules! tst_parse_line {
+        ($func:ident,$line:expr,$expected:expr) => {
+            #[test]
+            fn $func() {
+                assert_eq!(parse_line($line), $expected)
+            }
+        };
+    }
+    tst_parse_line!(
+        parse_line_works_negative_double_digit,
+        "StationName;-12.3",
+        ("StationName", -12.3)
+    );
+    tst_parse_line!(
+        parse_line_works_negative_only_decimal,
+        "StationName;-0.3",
+        ("StationName", -0.3)
+    );
+    tst_parse_line!(
+        parse_line_works_positive_single_digit,
+        "StationName;3.0",
+        ("StationName", 3.0)
+    );
+    tst_parse_line!(
+        parse_line_works_positive_only_decimal,
+        "StationName;0.6",
+        ("StationName", 0.6)
+    );
+    tst_parse_line!(
+        parse_line_works_positive_double_digit,
+        "StationName;99.9",
+        ("StationName", 99.9)
+    );
+
     macro_rules! tst {
         ($func:ident,$file_name:expr) => {
             #[test]

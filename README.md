@@ -94,11 +94,12 @@ This script uses hyperfine to measure an average run time of 10 runs, with no wa
 Here is a table for a quick summary of the current progress of the optimizations.
 Benchmarks and profiling results shown below are run against a `measurements.txt` generated with `./create_measurements.sh 1000000000`, having 1 billion entries using a 10-core 14" Macbook M1 Max 32 GB.
 
-| Optimization                                                                                  | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                                                                         |
-| --------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| [Initial Version](#initial-version)                                                           | 149.403 ± 0.452   | N/A                                                    | Naive single-core implementation with BufReader & HashMap                                                       |
-| [Unnecessary string allocation](#unnecessary-string-allocation)                               | 102.907 s ± 1.175 | <strong style="color:lime;"> -46,496 s (-31%)</strong> | Remove an unnecessary allocation of a string inside loop                                                        |
-| [Iterate over string slices instead of String](#iterate-over-string-slices-instead-of-string) | 63.493 s ± 1.368  | <strong style="color:lime;"> -39,414 s (-38%)</strong> | Read entire into memory first, iterate over string slices, move away from using Entry API for accessing hashmap |
+| Optimization                                                                                  | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                                                                                  |
+| --------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| [Initial Version](#initial-version)                                                           | 149.403 ± 0.452   | N/A                                                    | Naive single-core implementation with BufReader & HashMap                                                                |
+| [Unnecessary string allocation](#unnecessary-string-allocation)                               | 102.907 s ± 1.175 | <strong style="color:lime;"> -46,496 s (-31%)</strong> | Remove an unnecessary allocation of a string inside loop                                                                 |
+| [Iterate over string slices instead of String](#iterate-over-string-slices-instead-of-string) | 63.493 s ± 1.368  | <strong style="color:lime;"> -39,414 s (-38%)</strong> | Read the entire file into memory first, iterate over string slices, move away from using Entry API for accessing hashmap |
+| [Improving the line parsing #1](#improving-line-parsing)                                      | 55.686 s ± 1.304  | <strong style="color:lime;"> -7,807 s (-12%)</strong>  | Replace `str::find` with a custom, problem-specific separator finder                                                     |
 
 ### Initial Version
 
@@ -245,4 +246,37 @@ Benchmark 1: ./target/release/brc-rs
 ```
 
 ![Flamegraph of the program after implementing iterating over slices instead of String](iterate-over-slices.png)
+
+The line reading still uses quite a significant portion of the time (27% line iteration + 9% for loading the string into memory). However, it is not the biggest consumer of time anymore, which indicates we need to change our focus.
+We spend 39% of time inside `parse_line()` and need to do some improvements on that next.
+The `HashMap::get_mut()` is also starting to creep up in the chart with 23% of time spent.
+
+### Improving line parsing
+
+Now that we have gotten rid of most of the "free" improvements out of the way, we can start looking at actually improving the performance of the parsing logic of the lines.
+This section is divided in two parts; finding the data separator followed by improving the parsing logic.
+
+#### Replacing `str::find` with a custom separator finder
+
+Biggest share of time inside `parse_line()` is spent in [`str::find`](https://doc.rust-lang.org/std/primitive.str.html#method.find).
+This is used for separating the station name from the measurement data point.
+Using a generic "find from string"-function is fine for initial implementation and good for readability, but performance is being left on the table if we don't utilise all the knowledge we have.
+
+Reading the [challenge rules](https://github.com/gunnarmorling/1brc?tab=readme-ov-file#rules-and-limits), we know that the station name is a valid UTF-8 string with length varying between 1 and 100 bytes. The maximum length of the measurement data point is at most 5 characters ("-99.9") and is always pure ASCII.
+
+As the average length of a measurement is much smaller than the UTF-8 string, we can change our approach to start reading the line from the end.
+Also as the measurement is known to be pure ASCII, we can iterate over the bytes directly instead of the characters.
+
+This makes finding the separator use at most six byte comparison operations. We could further reduce this down to three, as there is always guaranteed to be 1 fractional digit, a period, and a whole number, but this is improvement is quite insignificant and we'd need to remove it anyway for the next part.
+
+```sh
+~/src/github/brc-rs (main\*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+Time (mean ± σ): 55.686 s ± 1.304 s [User: 50.524 s, System: 2.026 s]
+Range (min … max): 54.354 s … 57.095 s 5 runs
+```
+
+![Flamegraph of the program after implen](specialized-separator-finder.png)
+
+From the graph we see that `parse_line()` has shrunk significantly, with now the floating point value parsing taking majority of the time.
 
