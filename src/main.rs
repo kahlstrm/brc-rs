@@ -11,23 +11,50 @@ fn main() {
     return;
 }
 struct WeatherStationStats {
-    min: f64,
-    max: f64,
-    sum: f64,
+    min: i64,
+    max: i64,
+    sum: i64,
     count: usize,
 }
 impl WeatherStationStats {
     fn mean(&self) -> f64 {
-        self.sum / self.count as f64
+        self.sum as f64 / 10.0 / self.count as f64
     }
 }
-fn parse_line(line: &str) -> (&str, f64) {
+fn parse_line(line: &str) -> (&str, i64) {
     // we know that the measurement is pure ASCII and is at max 5 characters long
     // based on this we can find the semicolon faster by doing at most 6 byte comparisons by iterating the reversed bytes
-    // The resulting number is the 1-based index of the semicolon, hence the -1 in the end
-    let semicolon_idx = line.len() - line.bytes().rev().position(|b| b == b';').unwrap() - 1;
-    let measurement: f64 = (&line[semicolon_idx + 1..]).parse().unwrap();
-    (&line[..semicolon_idx], measurement)
+    // At the same time, we _are_ iterating through the measurement from the least significant character to the biggest
+    let mut semicolon_idx = 0;
+    let mut is_negative = false;
+    let mut measurement = 0;
+    for (idx, b) in line.bytes().rev().take(6).enumerate() {
+        match (b, idx) {
+            (b';', _) => {
+                // idx is 0-based starting from the end, meaning it is 1-based from the beginning, hence the -1
+                semicolon_idx = line.len() - idx - 1;
+                break;
+            }
+            (b'-', _) => is_negative = true,
+            (b'.', _) => (),
+            // reversed index 0, this is the fractional digit, add to measurement as is
+            (b, 0) => measurement += (b - b'0') as i64,
+            // reversed index 2, is the first whole number, "shift" it once to the left with * 10
+            (b, 2) => measurement += (b - b'0') as i64 * 10,
+            // reversed index 2, is the first whole number, "shift" it twice to the left with * 100
+            (b, 3) => measurement += (b - b'0') as i64 * 100,
+            // Data is of incorrect format, as in indices 1, 4 or 5 always must be one of the other characters
+            _ => unreachable!(),
+        }
+    }
+    (
+        &line[..semicolon_idx],
+        if is_negative {
+            -measurement
+        } else {
+            measurement
+        },
+    )
 }
 
 fn calc(file_name: Option<String>) -> String {
@@ -44,9 +71,9 @@ fn calc(file_name: Option<String>) -> String {
                 format!(
                     "{}={:.1}/{:.1}/{:.1}",
                     station,
-                    stats.min,
+                    stats.min as f64 / 10.0,
                     stats.mean(),
-                    stats.max
+                    stats.max as f64 / 10.0
                 )
             })
             .collect::<Vec<_>>()
@@ -103,27 +130,27 @@ mod tests {
     tst_parse_line!(
         parse_line_works_negative_double_digit,
         "StationName;-12.3",
-        ("StationName", -12.3)
+        ("StationName", -123)
     );
     tst_parse_line!(
         parse_line_works_negative_only_decimal,
         "StationName;-0.3",
-        ("StationName", -0.3)
+        ("StationName", -03)
     );
     tst_parse_line!(
         parse_line_works_positive_single_digit,
         "StationName;3.0",
-        ("StationName", 3.0)
+        ("StationName", 30)
     );
     tst_parse_line!(
         parse_line_works_positive_only_decimal,
         "StationName;0.6",
-        ("StationName", 0.6)
+        ("StationName", 6)
     );
     tst_parse_line!(
         parse_line_works_positive_double_digit,
         "StationName;99.9",
-        ("StationName", 99.9)
+        ("StationName", 999)
     );
 
     macro_rules! tst {
