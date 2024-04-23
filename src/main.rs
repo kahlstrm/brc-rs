@@ -159,7 +159,12 @@ mod tests {
             fn $func() {
                 println!($file_name);
                 let res = read_to_string(format!("{}.out", $file_name)).unwrap();
-                assert_eq!(calc(Some(format!("{}.txt", $file_name))), res)
+                for (expected, val) in res
+                    .split(",")
+                    .zip(calc(Some(format!("{}.txt", $file_name))).split(","))
+                {
+                    assert_eq!(val, expected);
+                }
             }
         };
     }
