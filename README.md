@@ -270,13 +270,13 @@ Also as the measurement is known to be pure ASCII, we can iterate over the bytes
 This makes finding the separator use at most six byte comparison operations. We could further reduce this down to three, as there is always guaranteed to be 1 fractional digit, a period, and a whole number, but this is improvement is quite insignificant and we'd need to remove it anyway for the next part.
 
 ```sh
-~/src/github/brc-rs (main\*) » ./bench.sh
+~/src/github/brc-rs (main*) » ./bench.sh
 Benchmark 1: ./target/release/brc-rs
 Time (mean ± σ): 55.686 s ± 1.304 s [User: 50.524 s, System: 2.026 s]
 Range (min … max): 54.354 s … 57.095 s 5 runs
 ```
 
-![Flamegraph of the program after implen](specialized-separator-finder.png)
+![Flamegraph of the program after implementing custom separator finder](specialized-separator-finder.png)
 
 From the graph we see that `parse_line()` has shrunk significantly, with now the floating point value parsing taking majority of the time.
 
