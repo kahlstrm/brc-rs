@@ -101,6 +101,7 @@ Benchmarks and profiling results shown below are run against a `measurements.txt
 | [Iterate over string slices instead of String](#iterate-over-string-slices-instead-of-string) | 63.493 s ± 1.368  | <strong style="color:lime;"> -39,414 s (-38%)</strong> | Read the entire file into memory first, iterate over string slices, move away from using Entry API for accessing hashmap |
 | [Improving the line parsing #1](#improving-line-parsing)                                      | 55.686 s ± 1.304  | <strong style="color:lime;"> -7,807 s (-12%)</strong>  | Replace `str::find` with a custom, problem-specific separator finder                                                     |
 | [Improving the line parsing #2](#writing-a-custom-measurement-parser)                         | 44.967 s ± 0.542  | <strong style="color:lime;"> -10,719 s (-19%)</strong> | Custom, byte based measurement value parser building on top of previous optimization                                     |
+| [Use `Vec<u8>` everywhere instead of `String`](#using-vecu8-instead-of-string)                | 38.470 s ± 0.485  | <strong style="color:lime;"> -6,497 s (-14%)</strong>  | Time save mostly from not needing to do UTF-8 validation when using `Vec<u8>`, as that is not necessary.                 |
 
 ### Initial Version
 
@@ -308,3 +309,23 @@ Benchmark 1: ./target/release/brc-rs
 ![Flamegraph of the program after implementing custom value parser](custom-value-parser.png)
 After these improvements, we have reduced our time spent in `parse_line()` from 39% to 14%.
 Quite happy with that, and time to look at other places for improvements, namely either the line-iterator or the hashmap operations.
+
+### Using `Vec<u8>` instead of `String`
+
+Now that our `parse_line()` function is totally custom, and both user bytes directly, there is no need for us to use strings anymore.
+On the right corner of the previous flamegraph, we can see that we spend around 5% of the program in something called `core::str::validations:run_utf8_validation`.
+This is UTF-8 string validation, as all `String`-types must be valid UTF-8 in Rust it runs always when not using `unsafe`.
+
+As none of our code beneath relies on having string slices anymore, we can get an easy win here by converting all Strings and string slices used in `aggregate_measurements()` to use `Vec<u8>` and byte slices respectively.
+Our hashmap also changes its signature to `HashMap<Vec<u8>,WeatherStationStats>`, and some string conversion is required in the result string calculation, but those take insignificant time over the hot path.
+
+```sh
+~/src/github/brc-rs (main\*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+Time (mean ± σ): 38.470 s ± 0.485 s [User: 33.038 s, System: 2.247 s]
+Range (min … max): 37.837 s … 38.919 s 5 runs
+```
+
+![Flamegraph of the program after converting Strings to Vec<u8> inside `aggregate_measurements`-function](use-vecu8-instead-of-string.png)
+The line iterator is still taking up 40% of all the time spent in the program, but optimization beyond this point seems quite difficult, and easier gains can be found elsewhere.
+Replacing the standard hashmap implementation seems like the logical step forward.

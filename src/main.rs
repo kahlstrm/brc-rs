@@ -21,14 +21,14 @@ impl WeatherStationStats {
         self.sum as f64 / 10.0 / self.count as f64
     }
 }
-fn parse_line(line: &str) -> (&str, i64) {
+fn parse_line(line: &[u8]) -> (&[u8], i64) {
     // we know that the measurement is pure ASCII and is at max 5 characters long
     // based on this we can find the semicolon faster by doing at most 6 byte comparisons by iterating the reversed bytes
     // At the same time, we _are_ iterating through the measurement from the least significant character to the biggest
     let mut semicolon_idx = 0;
     let mut is_negative = false;
     let mut measurement = 0;
-    for (idx, b) in line.bytes().rev().take(6).enumerate() {
+    for (idx, b) in line.into_iter().rev().take(6).enumerate() {
         match (b, idx) {
             (b';', _) => {
                 // idx is 0-based starting from the end, meaning it is 1-based from the beginning, hence the -1
@@ -70,7 +70,7 @@ fn calc(file_name: Option<String>) -> String {
             .map(|(station, stats)| {
                 format!(
                     "{}={:.1}/{:.1}/{:.1}",
-                    station,
+                    String::from_utf8(station).unwrap(),
                     stats.min as f64 / 10.0,
                     stats.mean(),
                     stats.max as f64 / 10.0
@@ -81,19 +81,22 @@ fn calc(file_name: Option<String>) -> String {
         + &String::from("}\n")
 }
 
-fn aggregate_measurements(mut reader: impl BufRead) -> HashMap<String, WeatherStationStats> {
-    let mut stations: HashMap<String, WeatherStationStats> = HashMap::new();
+fn aggregate_measurements(mut reader: impl BufRead) -> HashMap<Vec<u8>, WeatherStationStats> {
+    let mut stations: HashMap<Vec<u8>, WeatherStationStats> = HashMap::new();
 
-    // TODO: create an iterator out of the chunked reader logic, requires some lifetime magic
-    let mut kontsa = String::new();
+    let mut kontsa = Vec::new();
 
-    reader.read_to_string(&mut kontsa).unwrap();
-    kontsa.lines().for_each(|line| {
+    reader.read_to_end(&mut kontsa).unwrap();
+
+    for line in kontsa.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
         let (station, measurement) = parse_line(line);
         match stations.get_mut(station) {
             None => {
                 stations.insert(
-                    station.to_string(),
+                    station.to_vec(),
                     WeatherStationStats {
                         min: measurement,
                         max: measurement,
@@ -109,7 +112,7 @@ fn aggregate_measurements(mut reader: impl BufRead) -> HashMap<String, WeatherSt
                 s.sum += measurement;
             }
         };
-    });
+    }
     stations
 }
 
@@ -123,33 +126,34 @@ mod tests {
         ($func:ident,$line:expr,$expected:expr) => {
             #[test]
             fn $func() {
-                assert_eq!(parse_line($line), $expected)
+                let (station, measurement) = $expected;
+                assert_eq!(parse_line($line), (station.as_bytes(), measurement))
             }
         };
     }
     tst_parse_line!(
         parse_line_works_negative_double_digit,
-        "StationName;-12.3",
+        b"StationName;-12.3",
         ("StationName", -123)
     );
     tst_parse_line!(
         parse_line_works_negative_only_decimal,
-        "StationName;-0.3",
+        b"StationName;-0.3",
         ("StationName", -03)
     );
     tst_parse_line!(
         parse_line_works_positive_single_digit,
-        "StationName;3.0",
+        b"StationName;3.0",
         ("StationName", 30)
     );
     tst_parse_line!(
         parse_line_works_positive_only_decimal,
-        "StationName;0.6",
+        b"StationName;0.6",
         ("StationName", 6)
     );
     tst_parse_line!(
         parse_line_works_positive_double_digit,
-        "StationName;99.9",
+        b"StationName;99.9",
         ("StationName", 999)
     );
 
@@ -168,7 +172,6 @@ mod tests {
             }
         };
     }
-
     tst!(measurements_1, "samples/measurements-1");
     tst!(measurements_10, "samples/measurements-10");
     tst!(
