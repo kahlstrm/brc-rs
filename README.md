@@ -102,6 +102,7 @@ Benchmarks and profiling results shown below are run against a `measurements.txt
 | [Improving the line parsing #1](#improving-line-parsing)                                      | 55.686 s ± 1.304  | <strong style="color:lime;"> -7,807 s (-12%)</strong>  | Replace `str::find` with a custom, problem-specific separator finder                                                     |
 | [Improving the line parsing #2](#writing-a-custom-measurement-parser)                         | 44.967 s ± 0.542  | <strong style="color:lime;"> -10,719 s (-19%)</strong> | Custom, byte based measurement value parser building on top of previous optimization                                     |
 | [Use `Vec<u8>` everywhere instead of `String`](#using-vecu8-instead-of-string)                | 38.470 s ± 0.485  | <strong style="color:lime;"> -6,497 s (-14%)</strong>  | Time save mostly from not needing to do UTF-8 validation when using `Vec<u8>`, as that is not necessary.                 |
+| [a custom hash function](#using-a-custom-hash-function)                                       | 30.427 s ± 0.455  | <strong style="color:lime;"> -8,043 s (-21%)</strong>  | Use a custom hash function for the hashmap that is used by the Rust Compiler                                             |
 
 ### Initial Version
 
@@ -329,3 +330,34 @@ Range (min … max): 37.837 s … 38.919 s 5 runs
 ![Flamegraph of the program after converting Strings to Vec<u8> inside `aggregate_measurements`-function](use-vecu8-instead-of-string.png)
 The line iterator is still taking up 40% of all the time spent in the program, but optimization beyond this point seems quite difficult, and easier gains can be found elsewhere.
 Replacing the standard hashmap implementation seems like the logical step forward.
+
+### A custom hash function
+
+Currently, 23% of all time spent is in `hashbrown::map::make_hash`. This is the conversion of a hashable type (in this case `&[u8]`) to a 64-byte hash enclosed in a `u64`.
+This value can then be used to find the value from the underlying data structure, that is hidden from the end-user of a hashmap. Regardless, this is quite slow and can be improved.
+
+Hashmaps in Rust need to be provided a struct implementing the trait [`BuildHasher`](https://doc.rust-lang.org/std/hash/trait.BuildHasher.html).
+As one of would guess its task is to build [`Hashers`](https://doc.rust-lang.org/std/hash/trait.Hasher.html).
+One is built each time a new hash needs to be calculated.
+Hashers built by the same instance of a builder must always result in same output with the same input.
+
+The default `BuildHasher` that is the default for `HashMap` is [`RandomState`](https://doc.rust-lang.org/std/collections/hash_map/struct.RandomState.html).
+For each `RandomState`, a new randomized pair of keys is built that it then passes to it's hashers during construction.
+These randomized keys are there to prevent [Hash DoS attacks](https://en.wikipedia.org/wiki/Collision_attack) from malicious users.
+
+Given that our input is not malicious, we don't seem to benefit from the randomized seeding of the `HashMap`, so we can instead look for better performance instead.
+After looking around into alternatives, I found [`rustc_hash`](https://docs.rs/rustc-hash/latest/rustc_hash/) with quite a quite nice [`Hasher`-implementation](https://docs.rs/rustc-hash/latest/src/rustc_hash/lib.rs.html#76-109).
+Originally based on Firefox's hashing algorithm, this crate is used in `rustc` due to it's perforamnce over standard library.
+The characteristics of a compiler make it unsusceptible to Hash DoS-attacks.
+
+I took the `Hasher` implementation from that crate and integrated it only with `u64` instead of the original `usize`.
+This might technically break the rules a bit, but there are still no dependencies in the project (apart from `rand` and `rand_distr` for the measurements generation binary).
+
+```sh
+~/src/github/brc-rs (main*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+  Time (mean ± σ):     30.427 s ±  0.455 s    [User: 25.203 s, System: 1.876 s]
+  Range (min … max):   29.945 s … 31.111 s    5 runs
+```
+
+![Flamegraph of the program after using custom hash function](custom-hash-function.png)

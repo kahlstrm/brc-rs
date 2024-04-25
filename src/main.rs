@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     fs::File,
+    hash::{BuildHasherDefault, Hasher},
     io::{BufRead, BufReader},
+    ops::BitXor,
 };
 
 fn main() {
@@ -81,8 +83,55 @@ fn calc(file_name: Option<String>) -> String {
         + &String::from("}\n")
 }
 
-fn aggregate_measurements(mut reader: impl BufRead) -> HashMap<Vec<u8>, WeatherStationStats> {
-    let mut stations: HashMap<Vec<u8>, WeatherStationStats> = HashMap::new();
+type BuildCustomHasher = BuildHasherDefault<CustomHasher>;
+
+#[derive(Default, Clone)]
+struct CustomHasher {
+    hash: u64,
+}
+// yoinked from https://docs.rs/rustc-hash/1.1.0/src/rustc_hash/lib.rs.html#76-109
+impl CustomHasher {
+    fn add_to_hash(&mut self, i: u64) {
+        self.hash = self
+            .hash
+            .rotate_left(5)
+            .bitxor(i)
+            .wrapping_mul(0x517cc1b727220a95);
+    }
+}
+impl Hasher for CustomHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) {
+        // This clone tries to ensure that the compiler keeps the state in a register instead of memory
+        // https://github.com/rust-lang/rustc-hash/pull/34
+        let mut state = self.clone();
+        while bytes.len() >= 8 {
+            state.add_to_hash(u64::from_ne_bytes(bytes[..8].try_into().unwrap()));
+            bytes = &bytes[8..]
+        }
+
+        if bytes.len() >= 4 {
+            state.add_to_hash(u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64);
+            bytes = &bytes[4..];
+        }
+        if bytes.len() >= 2 {
+            state.add_to_hash(u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as u64);
+            bytes = &bytes[2..];
+        }
+        if bytes.len() >= 1 {
+            state.add_to_hash(u8::from_ne_bytes(bytes[..1].try_into().unwrap()) as u64);
+        }
+        *self = state;
+    }
+}
+// yoink end
+fn aggregate_measurements(
+    mut reader: impl BufRead,
+) -> HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher> {
+    let mut stations = HashMap::with_hasher(BuildCustomHasher::default());
 
     let mut kontsa = Vec::new();
 
