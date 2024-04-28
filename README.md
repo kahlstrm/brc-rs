@@ -103,6 +103,7 @@ Benchmarks and profiling results shown below are run against a `measurements.txt
 | [Improving the line parsing #2](#writing-a-custom-measurement-parser)                         | 44.967 s ± 0.542  | <strong style="color:lime;"> -10,719 s (-19%)</strong> | Custom, byte based measurement value parser building on top of previous optimization                                     |
 | [Use `Vec<u8>` everywhere instead of `String`](#using-vecu8-instead-of-string)                | 38.470 s ± 0.485  | <strong style="color:lime;"> -6,497 s (-14%)</strong>  | Time save mostly from not needing to do UTF-8 validation when using `Vec<u8>`, as that is not necessary.                 |
 | [a custom hash function](#using-a-custom-hash-function)                                       | 30.427 s ± 0.455  | <strong style="color:lime;"> -8,043 s (-21%)</strong>  | Use a custom hash function for the hashmap that is used by the Rust Compiler                                             |
+| [Custom chunked reader](#chunked-reader-to-reduce-memory-footprint--prepare-for-parallellism) | 29.310 s ± 0.276  | <strong style="color:lime;"> -1,117 s (-4%)</strong>   | Write a custom chunked file reader to prepare for parallellism and reduce memory allocation                              |
 
 ### Initial Version
 
@@ -361,3 +362,59 @@ Benchmark 1: ./target/release/brc-rs
 ```
 
 ![Flamegraph of the program after using custom hash function](custom-hash-function.png)
+
+### Chunked reader to reduce memory footprint & prepare for parallellism
+
+In section [Iterate over string slices instead of String](#iterate-over-string-slices-instead-of-string), we moved from reading the file line by line to loading the entire file first into memory instead.
+This caused our memory usage to increase to a staggering 13GB, but gained us some performance in not having to allocate and deallocate smaller strings constantly.
+
+However, as mentioned in the section, this was not the optimal/end result we wanted to achieve, and now it's time to go back to that.
+Allocating 13GB and reading the entire file is still inefficient, as we are blocked from doing anything for the whole duration when loading the file into memory.
+Looking the previous flame graph, this loading the file seems to be taking around 2-3 seconds. Ideally, we'd like to have the I/O distributed evenly along the program.
+
+Where this matters more is when we want to start utilizing multiple cores at once.
+With our current approach, when we spawn threads we'd start reading from the file system concurrently with each thread.
+This would then be putting more stress on the I/O, Thus blocking all the threads.
+
+To prevent the 13GB allocation and prepare for parallellism, it's time to ditch [`BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html) and write our own buffered reader.
+The concept is exactly the same as what `BufReader` does under the hood, but with us having full control of the underlying buffer and reading from the file.
+We'll create a fixed-size slice of bytes to act as our "buffer" where we'll read bytes into directly from the file handle (or anything that implements [`Read`](https://doc.rust-lang.org/std/io/trait.Read.html)-trait.)
+
+The complexity in this approach is handling the case when we hit the end of the currently read buffer.
+As we read a fixed amount in bytes at once, there is no guarantee that we read full lines.
+The last characters in the end of our buffer are most likely a start of a new line, but not a complete one.
+
+What we need to do to address is the following:
+
+1. Fill the buffer in it's entirety
+2. Parse the lines, keeping track of how many bytes we have read from the buffer.
+3. Do this until we hit the point where we do not find a newline-character
+4. Copy the remainining characters from the end to the start of the buffer.
+5. Read from the file to the buffer, but this time starting after the remaining characters we just copied.
+6. Repeat until we reach `EOF`. After that exit the loop.
+
+When we reach `EOF`, the [`Read::read`](https://doc.rust-lang.org/std/io/trait.Read.html#tymethod.read) returns `Ok(0)`, indicating that no new bytes were read. Combining with the fact that we only try reading more when we don't have a complete line in the remaining characters, we know that there are no more lines to be parsed, and we can exit the loop.
+
+```sh
+~/src/github/brc-rs (main*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+  Time (mean ± σ):     29.310 s ±  0.276 s    [User: 27.071 s, System: 1.465 s]
+  Range (min … max):   29.036 s … 29.696 s    5 runs
+```
+
+As expected, not that big of an improvement for the single-core result, only potential we save is that we don't need to allocate 13GB of contiguous memory.
+
+```sh
+~/src/github/brc-rs (main*) » /usr/bin/time -l target/release/brc-rs
+                ...
+29.40 real        27.21 user         1.52 sys
+      1261568  maximum resident set size
+                ...
+      967232  peak memory footprint
+```
+
+As we can see, our `peak memory footprint` is again under 1MB.
+![Flamegraph after chunked reader implementation](chunked-reader.png)
+
+Now looking at the graph, the ~2-3s I/O blocking for the CPU usage has vanished from the chart.
+As we do the same amount of blocking I/O than previously, this just means the blocking is distributed more evenly through the whole execution time.

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     hash::{BuildHasherDefault, Hasher},
-    io::{BufRead, BufReader},
+    io::Read,
     ops::BitXor,
 };
 
@@ -61,8 +61,8 @@ fn parse_line(line: &[u8]) -> (&[u8], i64) {
 
 fn calc(file_name: Option<String>) -> String {
     let f = File::open(file_name.as_deref().unwrap_or("measurements.txt")).unwrap();
-    let reader = BufReader::new(f);
-    let stations = aggregate_measurements(reader);
+
+    let stations = aggregate_measurements(f);
 
     let mut res = stations.into_iter().collect::<Vec<_>>();
     res.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -128,24 +128,35 @@ impl Hasher for CustomHasher {
     }
 }
 // yoink end
+
+const CHUNK_SIZE: usize = 50_000;
 fn aggregate_measurements(
-    mut reader: impl BufRead,
+    mut kontsa: impl Read,
 ) -> HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher> {
     let mut stations = HashMap::with_hasher(BuildCustomHasher::default());
-
-    let mut kontsa = Vec::new();
-
-    reader.read_to_end(&mut kontsa).unwrap();
-
-    for line in kontsa.split(|b| *b == b'\n') {
-        if line.is_empty() {
+    let mut buf = [0; CHUNK_SIZE];
+    let mut bytes_read = kontsa.read(&mut buf).unwrap();
+    let mut consumed = 0;
+    loop {
+        let Some(line_end_idx) = buf[consumed..bytes_read].iter().position(|b| *b == b'\n') else {
+            buf.copy_within(consumed..bytes_read, 0);
+            let remainder = bytes_read - consumed;
+            bytes_read = kontsa.read(&mut buf[remainder..]).unwrap();
+            // here if we get bytes_read == 0, which means we did not add anything to remaining characters
+            // and as we are here already, we know that there is no valid line
+            if bytes_read == 0 {
+                break;
+            }
+            bytes_read += remainder;
+            consumed = 0;
             continue;
-        }
-        let (station, measurement) = parse_line(line);
-        match stations.get_mut(station) {
+        };
+        let (station_name, measurement) = parse_line(&buf[consumed..consumed + line_end_idx]);
+
+        match stations.get_mut(station_name) {
             None => {
                 stations.insert(
-                    station.to_vec(),
+                    station_name.to_vec(),
                     WeatherStationStats {
                         min: measurement,
                         max: measurement,
@@ -161,6 +172,8 @@ fn aggregate_measurements(
                 s.sum += measurement;
             }
         };
+        // We have "consumed" one line of input
+        consumed += line_end_idx + 1;
     }
     stations
 }
