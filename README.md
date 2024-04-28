@@ -96,7 +96,7 @@ Benchmarks and profiling results shown below are run against a `measurements.txt
 
 | Optimization                                                                                  | Time (mean ± σ):  | Improvement over previous version                      | Summary                                                                                                                  |
 | --------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| [Initial Version](#initial-version)                                                           | 149.403 ± 0.452   | N/A                                                    | Naive single-core implementation with BufReader & HashMap                                                                |
+| [Initial Version](#initial-version)                                                           | 149.403 s ± 0.452 | N/A                                                    | Naive single-core implementation with BufReader & HashMap                                                                |
 | [Unnecessary string allocation](#unnecessary-string-allocation)                               | 102.907 s ± 1.175 | <strong style="color:lime;"> -46,496 s (-31%)</strong> | Remove an unnecessary allocation of a string inside loop                                                                 |
 | [Iterate over string slices instead of String](#iterate-over-string-slices-instead-of-string) | 63.493 s ± 1.368  | <strong style="color:lime;"> -39,414 s (-38%)</strong> | Read the entire file into memory first, iterate over string slices, move away from using Entry API for accessing hashmap |
 | [Improving the line parsing #1](#improving-line-parsing)                                      | 55.686 s ± 1.304  | <strong style="color:lime;"> -7,807 s (-12%)</strong>  | Replace `str::find` with a custom, problem-specific separator finder                                                     |
@@ -387,7 +387,7 @@ The last characters in the end of our buffer are most likely a start of a new li
 
 What we need to do to address is the following:
 
-1. Fill the buffer in it's entirety
+1. Fill the buffer in its entirety
 2. Parse the lines, keeping track of how many bytes we have read from the buffer.
 3. Do this until we hit the point where we do not find a newline-character
 4. Copy the remainining characters from the end to the start of the buffer.
