@@ -104,6 +104,7 @@ Benchmarks and profiling results shown below are run against a `measurements.txt
 | [Use `Vec<u8>` everywhere instead of `String`](#using-vecu8-instead-of-string)                | 38.470 s ± 0.485  | <strong style="color:lime;"> -6,497 s (-14%)</strong>  | Time save mostly from not needing to do UTF-8 validation when using `Vec<u8>`, as that is not necessary.                 |
 | [a custom hash function](#using-a-custom-hash-function)                                       | 30.427 s ± 0.455  | <strong style="color:lime;"> -8,043 s (-21%)</strong>  | Use a custom hash function for the hashmap that is used by the Rust Compiler                                             |
 | [Custom chunked reader](#chunked-reader-to-reduce-memory-footprint--prepare-for-parallellism) | 29.310 s ± 0.276  | <strong style="color:lime;"> -1,117 s (-4%)</strong>   | Write a custom chunked file reader to prepare for parallellism and reduce memory allocation                              |
+| [Tweak chunk size](#tweaking-the-chunk_size)                                                  | 28.663 s ± 0.546  | <strong style="color:lime;"> -0,647 s (-2%)</strong>   | Small tweak for the fixed buffer-size created in previous improvement                                                    |
 
 ### Initial Version
 
@@ -418,3 +419,17 @@ As we can see, our `peak memory footprint` is again under 1MB.
 
 Now looking at the graph, the ~2-3s I/O blocking for the CPU usage has vanished from the chart.
 As we do the same amount of blocking I/O than previously, this just means the blocking is distributed more evenly through the whole execution time.
+
+#### Tweaking the `CHUNK_SIZE`
+
+In the first chunked reader implementation, an arbitrary chunk-size of 50 000 bytes was chosen.
+This can be thought of as a byte-interval, after we start reading the file again.
+With too small of a chunk-size, we start paying for the I/O overhead unnecessarily.
+After some testing, it seems that that 500 000 bytes (0,5 MB) seems to be a better balance between I/O overhead and memory usage on an M1 Mac.
+
+```sh
+~/src/github/brc-rs (254edb8) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+  Time (mean ± σ):     28.663 s ±  0.546 s    [User: 26.501 s, System: 1.259 s]
+  Range (min … max):   28.304 s … 29.631 s    5 runs
+```

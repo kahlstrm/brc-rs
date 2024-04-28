@@ -129,7 +129,7 @@ impl Hasher for CustomHasher {
 }
 // yoink end
 
-const CHUNK_SIZE: usize = 50_000;
+const CHUNK_SIZE: usize = 500_000;
 fn aggregate_measurements(
     mut kontsa: impl Read,
 ) -> HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher> {
