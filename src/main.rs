@@ -2,8 +2,11 @@ use std::{
     collections::HashMap,
     fs::File,
     hash::{BuildHasherDefault, Hasher},
-    io::Read,
-    ops::BitXor,
+    io::{BufRead, BufReader, Read, Seek},
+    num::NonZeroUsize,
+    ops::{Add, BitXor},
+    sync::{Arc, Mutex},
+    thread,
 };
 
 fn main() {
@@ -21,6 +24,18 @@ struct WeatherStationStats {
 impl WeatherStationStats {
     fn mean(&self) -> f64 {
         self.sum as f64 / 10.0 / self.count as f64
+    }
+}
+impl Add<&mut Self> for WeatherStationStats {
+    type Output = Self;
+
+    fn add(self, rhs: &mut Self) -> Self::Output {
+        WeatherStationStats {
+            min: self.min.min(rhs.min),
+            max: self.max.max(rhs.max),
+            sum: self.sum + rhs.sum,
+            count: self.count + rhs.count,
+        }
     }
 }
 fn parse_line(line: &[u8]) -> (&[u8], i64) {
@@ -46,7 +61,11 @@ fn parse_line(line: &[u8]) -> (&[u8], i64) {
             // reversed index 2, is the first whole number, "shift" it twice to the left with * 100
             (b, 3) => measurement += (b - b'0') as i64 * 100,
             // Data is of incorrect format, as in indices 1, 4 or 5 always must be one of the other characters
-            _ => unreachable!(),
+            (b, _) => panic!(
+                "{} , {:#?}",
+                String::from_utf8(vec![*b]).unwrap(),
+                String::from_utf8(line.to_vec())
+            ),
         }
     }
     (
@@ -58,13 +77,76 @@ fn parse_line(line: &[u8]) -> (&[u8], i64) {
         },
     )
 }
-
+struct Chunk {
+    start_point: u64,
+    len: usize,
+    outer_map: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
+}
+fn chunk_le_file<T: BufRead + Seek>(
+    mut f: T,
+    file_len: usize,
+    arccimuuteksi: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
+) -> Vec<Chunk> {
+    let chunk_count = std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1)
+    // do a sneaky 4x chunks vs available threads to allow OS scheduler to switch between threads,
+    // potentially enabling I/O blocked threads being swapped to threads where I/O is not blocked.
+    // 4 was tested to provide best perf with both M1 Macbook Max and Ryzen 5950x
+    * 4;
+    let chunk_size = file_len / chunk_count + 1;
+    // max length of line is 100 bytes station name, ';', '-99.9', '\n'
+    let mut tmp_arr = Vec::with_capacity(107);
+    let mut res = vec![];
+    let mut cur_start = 0;
+    for _ in 0..chunk_count {
+        f.seek(std::io::SeekFrom::Current(chunk_size as i64))
+            .unwrap();
+        f.read_until(b'\n', &mut tmp_arr).unwrap();
+        let end_pos = f.stream_position().unwrap();
+        res.push(Chunk {
+            start_point: cur_start,
+            len: (end_pos - cur_start) as usize,
+            outer_map: arccimuuteksi.clone(),
+        });
+        tmp_arr.clear();
+        cur_start = end_pos
+    }
+    res
+}
 fn calc(file_name: Option<String>) -> String {
-    let f = File::open(file_name.as_deref().unwrap_or("measurements.txt")).unwrap();
+    let file_name: Arc<str> = file_name.unwrap_or("measurements.txt".into()).into();
+    let f = File::open(file_name.to_string()).unwrap();
+    let file_len = f.metadata().unwrap().len() as usize;
+    let stations = Arc::new(Mutex::new(HashMap::<Vec<u8>, WeatherStationStats>::new()));
+    let chunks = chunk_le_file(BufReader::new(f), file_len, stations.clone());
+    let handles = chunks
+        .into_iter()
+        .map(|c| {
+            let file_name = file_name.clone();
+            thread::spawn(move || {
+                let mut f = File::open(file_name.to_string()).unwrap();
+                f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
+                let f = f.take(c.len as u64);
+                let stations_välipala = aggregate_measurements(f);
+                let mut stations = c.outer_map.lock().unwrap();
+                for (k, v) in stations_välipala {
+                    match stations.get_mut(&k) {
+                        Some(jutska) => *jutska = v + jutska,
+                        None => {
+                            stations.insert(k, v);
+                        }
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for h in handles {
+        h.join().unwrap()
+    }
+    let lock = stations.lock().unwrap();
+    let mut res = lock.iter().collect::<Vec<_>>();
 
-    let stations = aggregate_measurements(f);
-
-    let mut res = stations.into_iter().collect::<Vec<_>>();
     res.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     String::from("{")
         + &res
@@ -72,7 +154,7 @@ fn calc(file_name: Option<String>) -> String {
             .map(|(station, stats)| {
                 format!(
                     "{}={:.1}/{:.1}/{:.1}",
-                    String::from_utf8(station).unwrap(),
+                    String::from_utf8_lossy(station),
                     stats.min as f64 / 10.0,
                     stats.mean(),
                     stats.max as f64 / 10.0

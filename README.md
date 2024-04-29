@@ -105,6 +105,7 @@ Benchmarks and profiling results shown below are run against a `measurements.txt
 | [a custom hash function](#using-a-custom-hash-function)                                       | 30.427 s ± 0.455  | <strong style="color:lime;"> -8,043 s (-21%)</strong>  | Use a custom hash function for the hashmap that is used by the Rust Compiler                                             |
 | [Custom chunked reader](#chunked-reader-to-reduce-memory-footprint--prepare-for-parallellism) | 29.310 s ± 0.276  | <strong style="color:lime;"> -1,117 s (-4%)</strong>   | Write a custom chunked file reader to prepare for parallellism and reduce memory allocation                              |
 | [Tweak chunk size](#tweaking-the-chunk_size)                                                  | 28.663 s ± 0.546  | <strong style="color:lime;"> -0,647 s (-2%)</strong>   | Small tweak for the fixed buffer-size created in previous improvement                                                    |
+| [Multithreading](#multithreading)                                                             | 3.747 s ± 0.093   | <strong style="color:lime;"> -24,916 s (-87%)</strong> | Multithread the program to utilize all cores on the system                                                               |
 
 ### Initial Version
 
@@ -433,3 +434,54 @@ Benchmark 1: ./target/release/brc-rs
   Time (mean ± σ):     28.663 s ±  0.546 s    [User: 26.501 s, System: 1.259 s]
   Range (min … max):   28.304 s … 29.631 s    5 runs
 ```
+
+### Multithreading
+
+We have now prepared our program to be able to handle multiple threads at once, and we can start utilizing them to speed up the program.
+
+One might wonder why this wasn't done earlier, but profiling and optimizing a single-threaded program is much more straightforward than a multithreaded one.
+As long as we keep the fact that we are going to use multiple threads in mind, we can optimize the single-threaded program to be as fast as possible, and then just spawn more threads to do the same work.
+
+We need to somehow divide the work we have done sequentially into multiple threads.
+This can be achieved by dividing the file into chunks and then processing each chunk in a separate thread.
+
+However, we need to be careful when creating the chunks, as we need to make sure that we don't split the lines in the middle.
+To do this, we can "peek into" the file at `chunk_size`, and then read forwards until we find a newline character.
+Then set the next chunk to start after that newline character.
+
+After creating the chunks, we can then spawn a thread for each chunk, and have them process the chunk in parallel.
+
+After a thread is finished, it will insert its results into the shared hashmap, locked by a [`Mutex`](https://doc.rust-lang.org/std/sync/struct.Mutex.html).
+As we are using a `Mutex`, only one thread can access the hashmap at a time, blocking other threads from accessing it until the lock is released.
+This time isn't a problem, as the amount of time spend holding the lock is minimal compared to the time spent processing the data.
+
+```sh
+~/src/github/brc-rs (main*) » ./bench.sh
+Benchmark 1: ./target/release/brc-rs
+  Time (mean ± σ):      3.747 s ±  0.093 s    [User: 29.739 s, System: 2.102 s]
+  Range (min … max):    3.679 s …  3.910 s    5 runs
+```
+
+![Flamegraph of the multithread program, showing the main thread](multithreaded-main-thread.png)
+As we can see from the flamegraph, the main thread is mostly waiting for the other threads to finish their work.
+Other threads are then doing the actual work of reading the file and processing the data.
+
+Looking at the threads doing the processing, we can see that there are sections where some of the threads have 0% CPU usage.
+This is due to I/O blocking, as the thread is waiting for the file to be read into memory.
+
+A slight trick to improve the I/O blocking nature was to create more chunks than there are threads available.
+This allows the OS scheduler to switch between threads, potentially enabling I/O blocked threads to be swapped to threads where I/O is not blocked.
+
+## Conclusion
+
+The final(?) result is a program that can process 1 billion rows in 3.7 seconds on a 10-core M1 Macbook Pro.
+This is a 97% improvement over the initial version.
+
+A big chunk of the improvement came from multithreading in the end, but without the single-core optimizations done first, we couldn't have been able to parallelize the program as effectively.
+Keeping the program single-threaded first allowed us to iterate on the program more easily.
+
+The program is now utilizing all cores on the system, and the I/O blocking is distributed more evenly throughout the program.
+The memory footprint is kept low, and the program is quite optimized.
+
+More optimizations could be done, for instance making line parsing branchless, using memory-mapped files, but the latter would require use of `unsafe`-code or external crates, which were not in scope for this project.
+For now, I'm quite happy with the results, and I'll leave it at that (for now?)
