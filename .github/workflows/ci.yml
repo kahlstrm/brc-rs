@@ -36,7 +36,13 @@ jobs:
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
       - run: cargo install hyperfine
+      - name: Build release
+        run: cargo build --release
       - name: Benchmark
+        if: matrix.os != 'windows-latest'
         run: |
-          cargo build --quiet --release
-          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs${{matrix.os=='windows' && '.exe' ||''}}"
+          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs"
+      - name: Benchmark
+        if: matrix.os == 'windows-latest'
+        run: |
+          hyperfine --warmup 0 --runs 5 "target\release\brc-rs.exe"
