@@ -39,4 +39,4 @@ jobs:
       - name: Benchmark
         run: |
           cargo build --quiet --release
-          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs $1"
+          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs${{matrix.os=='windows' && '.exe' ||''}} $1"
