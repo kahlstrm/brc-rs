@@ -46,7 +46,7 @@ fn parse_line(mut line: &[u8]) -> (&[u8], i64) {
     let mut is_negative = false;
     let mut measurement = 0;
     // stupid Windows check
-    if line[line.len() - 1] == b'\r' {
+    if cfg!(windows) && line[line.len() - 1] == b'\r' {
         line = &line[..line.len() - 1];
     }
     for (idx, b) in line.into_iter().rev().take(6).enumerate() {
