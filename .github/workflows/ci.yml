@@ -41,8 +41,10 @@ jobs:
       - name: Benchmark
         if: matrix.os != 'windows-latest'
         run: |
+          python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
           hyperfine --warmup 0 --runs 5 "./target/release/brc-rs"
       - name: Benchmark
         if: matrix.os == 'windows-latest'
         run: |
+          python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
           hyperfine --warmup 0 --runs 5 "target\release\brc-rs.exe"
