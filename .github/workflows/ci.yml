@@ -13,19 +13,43 @@ env:
 
 jobs:
   build_and_test:
-    name: Rust project - latest
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         toolchain:
           - stable
           - beta
           - nightly
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - macos-13
     steps:
       - uses: actions/checkout@v4
-      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - name: Rustup update
+        if: matrix.os != 'windows-latest'
+        run: rustup update ${{ matrix.toolchain }}
+      - run: rustup default ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          key: ${{ runner.os }}-${{ matrix.toolchain }}
       - run: cargo build --verbose
       - run: cargo test --verbose
-      - run: ./create_measurements.sh 1_000_000_000
+      - name: Create measurements
+        run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
       - run: cargo install hyperfine
-      - run: ./bench.sh
+      - name: Build release
+        run: cargo build --release
+      - name: Benchmark
+        if: matrix.os != 'windows-latest'
+        run: |
+          python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
+          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs"
+      - name: Benchmark
+        if: matrix.os == 'windows-latest'
+        run: |
+          python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
+          hyperfine --warmup 0 --runs 5 "target\release\brc-rs.exe"
