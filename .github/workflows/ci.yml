@@ -14,18 +14,29 @@ env:
 jobs:
   build_and_test:
     name: Rust project - latest
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         toolchain:
           - stable
           - beta
           - nightly
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - name: Rustup update
+        if: matrix.os != 'windows-latest'
+        run: rustup update ${{ matrix.toolchain }}
+      - run: rustup default ${{ matrix.toolchain }}
       - run: cargo build --verbose
       - run: cargo test --verbose
-      - run: ./create_measurements.sh 1_000_000_000
+      - name: Create measurements
+        run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
       - run: cargo install hyperfine
-      - run: ./bench.sh
+      - name: Benchmark
+        run: |
+          cargo build --quiet --release
+          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs $1"
