@@ -38,13 +38,17 @@ impl Add<&mut Self> for WeatherStationStats {
         }
     }
 }
-fn parse_line(line: &[u8]) -> (&[u8], i64) {
+fn parse_line(mut line: &[u8]) -> (&[u8], i64) {
     // we know that the measurement is pure ASCII and is at max 5 characters long
     // based on this we can find the semicolon faster by doing at most 6 byte comparisons by iterating the reversed bytes
     // At the same time, we _are_ iterating through the measurement from the least significant character to the biggest
     let mut semicolon_idx = 0;
     let mut is_negative = false;
     let mut measurement = 0;
+    // stupid Windows check
+    if line[line.len() - 1] == b'\r' {
+        line = &line[..line.len() - 1];
+    }
     for (idx, b) in line.into_iter().rev().take(6).enumerate() {
         match (b, idx) {
             (b';', _) => {
@@ -311,7 +315,7 @@ mod tests {
                     .split(",")
                     .zip(calc(Some(format!("{}.txt", $file_name))).split(","))
                 {
-                    assert_eq!(val, expected);
+                    assert_eq!(val.trim(), expected.trim());
                 }
             }
         };
