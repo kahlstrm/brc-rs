@@ -46,6 +46,10 @@ fn generate_measurements<W: Write + Send + 'static>(
 ) -> std::io::Result<()> {
     let start = Instant::now();
     let par_count = std::thread::available_parallelism().unwrap();
+    println!(
+        "Starting generating {} measurements with {} threads",
+        size, par_count
+    );
     let task_size = size / par_count;
     let mut tasks = vec![task_size; par_count.into()];
     for i in 0..(size % par_count) {
