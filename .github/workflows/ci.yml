@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true
-          key: ${{ runner.os }}-${{ matrix.toolchain }}
+          shared-key: ${{ runner.os }}-${{ matrix.toolchain }}
       - run: cargo build --verbose
       - run: cargo test --verbose
       - name: Create measurements
