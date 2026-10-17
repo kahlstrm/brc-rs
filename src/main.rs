@@ -205,7 +205,7 @@ fn calc(file_name: Option<String>) -> String {
 /// Bytes of a station name stored inline in its slot and compared as two words
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
 /// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
-const TABLE_SIZE: usize = 1 << 15;
+const TABLE_SIZE: usize = 1 << 16;
 /// `KEY_MASKS[n]` keeps the lowest `n` bytes of a little-endian word
 const KEY_MASKS: [u64; 9] = {
     let mut masks = [0; 9];
