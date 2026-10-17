@@ -89,10 +89,7 @@ fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
             .parse::<NonZeroUsize>()
             .unwrap_or_else(|_| panic!("BRC_THREADS must be a positive integer, got {s:?}"))
             .get(),
-        // do a sneaky 4x chunks vs available threads to allow OS scheduler to switch between threads,
-        // potentially enabling I/O blocked threads being swapped to threads where I/O is not blocked.
-        // 4 was tested to provide best perf with both M1 Macbook Max and Ryzen 5950x
-        None => parallelism * 4,
+        None => parallelism,
     }
 }
 fn chunk_le_file<T: BufRead + Seek>(
@@ -281,8 +278,8 @@ mod tests {
     use crate::thread_count;
 
     #[test]
-    fn thread_count_defaults_to_4x_parallelism() {
-        assert_eq!(thread_count(None, 8), 32);
+    fn thread_count_defaults_to_parallelism() {
+        assert_eq!(thread_count(None, 8), 8);
     }
     #[test]
     fn thread_count_uses_override() {
