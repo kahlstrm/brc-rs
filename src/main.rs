@@ -219,6 +219,32 @@ impl Hasher for CustomHasher {
 }
 // yoink end
 
+fn record(
+    stations: &mut HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher>,
+    station_name: &[u8],
+    measurement: i64,
+) {
+    match stations.get_mut(station_name) {
+        None => {
+            stations.insert(
+                station_name.to_vec(),
+                WeatherStationStats {
+                    min: measurement,
+                    max: measurement,
+                    sum: measurement,
+                    count: 1,
+                },
+            );
+        }
+        Some(s) => {
+            s.max = s.max.max(measurement);
+            s.min = s.min.min(measurement);
+            s.count += 1;
+            s.sum += measurement;
+        }
+    }
+}
+
 const CHUNK_SIZE: usize = 500_000;
 fn aggregate_measurements(
     mut kontsa: impl Read,
@@ -243,25 +269,7 @@ fn aggregate_measurements(
         };
         let (station_name, measurement) = parse_line(&buf, consumed, consumed + line_end_idx);
 
-        match stations.get_mut(station_name) {
-            None => {
-                stations.insert(
-                    station_name.to_vec(),
-                    WeatherStationStats {
-                        min: measurement,
-                        max: measurement,
-                        sum: measurement,
-                        count: 1,
-                    },
-                );
-            }
-            Some(s) => {
-                s.max = s.max.max(measurement);
-                s.min = s.min.min(measurement);
-                s.count += 1;
-                s.sum += measurement;
-            }
-        };
+        record(&mut stations, station_name, measurement);
         // We have "consumed" one line of input
         consumed += line_end_idx + 1;
     }
