@@ -113,17 +113,23 @@ fn synthetic_names(count: usize) -> Vec<String> {
     while names.len() < count {
         let len = (4.0 + 2500.0 * (rng.gen::<f64>() - 0.372).powi(7)).max(1.0) as usize;
         let mut name: Vec<char> = source.by_ref().take(len).collect();
-        while name.iter().collect::<String>().len() > 100 {
-            name.pop();
-        }
         let last = name.len() - 1;
         for end in [0, last] {
             if name[end].is_whitespace() {
                 name[end] = source.find(|c| !c.is_whitespace()).unwrap();
             }
         }
-        // there are fewer distinct short slices than names needing them, so those grow instead
-        while taken.contains(&name) {
+        loop {
+            // last, as the edits above and below can swap in longer characters
+            while name.iter().collect::<String>().len() > 100
+                || name.last().unwrap().is_whitespace()
+            {
+                name.pop();
+            }
+            if !taken.contains(&name) {
+                break;
+            }
+            // there are fewer distinct short slices than names needing them, so those grow instead
             let c = source.find(|c| !c.is_whitespace()).unwrap();
             match name.len() {
                 ..3 => name.push(c),
