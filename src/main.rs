@@ -60,22 +60,51 @@ fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
 }
 
-/// Finds the first ';' at or after `start`, checking 8 bytes at a time (SWAR)
-fn find_semicolon(buf: &[u8], start: usize) -> usize {
+/// Sets the high bit of each ';' byte of `word` (SWAR).
+/// Only the lowest match is guaranteed to be exact, which is the one we need
+fn semicolon_matches(word: u64) -> u64 {
     const ONES: u64 = 0x0101_0101_0101_0101;
     const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
     const SEMICOLONS: u64 = ONES * b';' as u64;
+    let x = word ^ SEMICOLONS;
+    x.wrapping_sub(ONES) & !x & HIGH_BITS
+}
+
+/// Finds the first ';' at or after `start`, checking 8 bytes at a time
+fn find_semicolon(buf: &[u8], start: usize) -> usize {
     let mut at = start;
     loop {
-        let x = load_u64(buf, at) ^ SEMICOLONS;
-        // sets the high bit of each zero byte of x, i.e. each ';'.
-        // Only the lowest match is guaranteed to be exact, which is the one we need
-        let matches = x.wrapping_sub(ONES) & !x & HIGH_BITS;
+        let matches = semicolon_matches(load_u64(buf, at));
         if matches != 0 {
             return at + (matches.trailing_zeros() / 8) as usize;
         }
         at += 8;
     }
+}
+
+/// Keeps the lowest `n` bytes of a little-endian word, for `n` in `0..=8`
+fn low_bytes(word: u64, n: u32) -> u64 {
+    word & u64::MAX.checked_shr(64 - 8 * n).unwrap_or(0)
+}
+
+/// Finds the ';' ending the station name at `start` and the name's first 16 bytes as zero-padded key words.
+/// Names of up to 16 bytes, nearly all of them, are found without a loop
+fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
+    let words = [load_u64(buf, start), load_u64(buf, start + 8)];
+    // bytes before the first ';' of each word, 8 if it has none
+    let [first_len, second_len] = words.map(|word| semicolon_matches(word).trailing_zeros() / 8);
+    let second_len = if first_len < 8 { 0 } else { second_len };
+    let key = [
+        low_bytes(words[0], first_len),
+        low_bytes(words[1], second_len),
+    ];
+    let len = (first_len + second_len) as usize;
+    let semicolon = if len < INLINE_KEY_LEN {
+        start + len
+    } else {
+        find_semicolon(buf, start + INLINE_KEY_LEN)
+    };
+    (semicolon, key)
 }
 
 /// Branchless parse of a temperature (`-99.9`..`99.9`, one fractional digit) from the 8 bytes starting at it.
@@ -95,12 +124,13 @@ fn parse_temperature(word: u64) -> (i64, usize) {
     (value, (dot_bit / 8) as usize + 3)
 }
 
-/// Parses the line starting at `start`, returning the station name, the measurement and the line length
-fn parse_line(buf: &[u8], start: usize) -> (&[u8], i64, usize) {
-    let semicolon = find_semicolon(buf, start);
+/// Parses the line starting at `start`, returning the station name, its key words, the measurement and the line length
+fn parse_line(buf: &[u8], start: usize) -> (&[u8], [u64; 2], i64, usize) {
+    let (semicolon, key) = parse_name(buf, start);
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
     (
         &buf[start..semicolon],
+        key,
         measurement,
         semicolon + 1 + temperature_len - start,
     )
@@ -206,25 +236,6 @@ fn calc(file_name: Option<String>) -> String {
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
 /// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
 const TABLE_SIZE: usize = 1 << 16;
-/// `KEY_MASKS[n]` keeps the lowest `n` bytes of a little-endian word
-const KEY_MASKS: [u64; 9] = {
-    let mut masks = [0; 9];
-    let mut n = 1;
-    while n <= 8 {
-        masks[n] = u64::MAX >> (64 - 8 * n);
-        n += 1;
-    }
-    masks
-};
-
-/// The first `INLINE_KEY_LEN` bytes of the name at `start`, zero-padded
-fn key_words(buf: &[u8], start: usize, len: usize) -> [u64; 2] {
-    [
-        load_u64(buf, start) & KEY_MASKS[len.min(8)],
-        load_u64(buf, start + 8) & KEY_MASKS[len.clamp(8, 16) - 8],
-    ]
-}
-
 /// Bytes past the inline key only exist for long names, which are rare enough to hash bytewise
 fn slot_index(key: [u64; 2], tail: &[u8]) -> usize {
     const K: u64 = 0x517c_c1b7_2722_0a95;
@@ -265,10 +276,9 @@ impl StationTable {
         }
     }
 
-    /// Records a measurement for `name`, which starts at `start` in `buf`
-    fn record(&mut self, buf: &[u8], start: usize, name: &[u8], measurement: i64) {
+    /// Records a measurement for `name`, whose first bytes are `key`
+    fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
         let len = name.len();
-        let key = key_words(buf, start, len);
         let tail = name.get(INLINE_KEY_LEN..).unwrap_or_default();
         let mut i = slot_index(key, tail);
         loop {
@@ -328,8 +338,8 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
         };
         let mut consumed = 0;
         while consumed < parse_until {
-            let (station_name, measurement, line_len) = parse_line(&buf, consumed);
-            stations.record(&buf, consumed, station_name, measurement);
+            let (station_name, key, measurement, line_len) = parse_line(&buf, consumed);
+            stations.record(key, station_name, measurement);
             consumed += line_len;
         }
         if at_eof {
@@ -346,7 +356,6 @@ mod tests {
     use std::fs::read_to_string;
 
     use crate::calc;
-    use crate::key_words;
     use crate::parse_line;
     use crate::parse_temperature;
     use crate::slot_index;
@@ -367,7 +376,7 @@ mod tests {
         thread_count(Some("0".into()), 8);
     }
     /// Parses the first line of `line` followed by another line and padding, as in the read buffer
-    fn parse_first_line(line: &[u8]) -> (&[u8], i64, usize) {
+    fn parse_first_line(line: &[u8]) -> (&[u8], [u64; 2], i64, usize) {
         let buf = [line, b"Next;-1.0\n", &[0; PADDING]].concat().leak();
         parse_line(buf, 0)
     }
@@ -379,7 +388,7 @@ mod tests {
             // the last line of a file may lack its '\n', which is the furthest a load reaches
             for line in [format!("a;{temperature}\n"), format!("a;{temperature}")] {
                 let buf = [line.as_bytes(), &[0; PADDING]].concat();
-                let (station, measurement, _) = parse_line(&buf, 0);
+                let (station, _, measurement, _) = parse_line(&buf, 0);
                 assert_eq!((station, measurement), (&b"a"[..], expected), "{line:?}");
             }
         }
@@ -389,8 +398,9 @@ mod tests {
             #[test]
             fn $func() {
                 let (station, measurement) = $expected;
+                let (name, _, parsed, line_len) = parse_first_line($line);
                 assert_eq!(
-                    parse_first_line($line),
+                    (name, parsed, line_len),
                     (station.as_bytes(), measurement, $line.len())
                 )
             }
@@ -440,11 +450,17 @@ mod tests {
     #[test]
     fn parse_line_works_for_all_name_lengths() {
         for len in 1..=100 {
-            let name = "x".repeat(len);
-            let line = format!("{name};-12.3\n");
+            let name: Vec<u8> = (b'a'..=b'z').cycle().take(len).collect();
+            let line = [&name[..], b";-12.3\n"].concat();
+            let mut inline = [0; 16];
+            inline[..len.min(16)].copy_from_slice(&name[..len.min(16)]);
+            let key = [
+                u64::from_le_bytes(inline[..8].try_into().unwrap()),
+                u64::from_le_bytes(inline[8..].try_into().unwrap()),
+            ];
             assert_eq!(
-                parse_first_line(line.as_bytes()),
-                (name.as_bytes(), -123, line.len()),
+                parse_first_line(&line),
+                (&name[..], key, -123, line.len()),
                 "name length {len}"
             );
         }
@@ -463,10 +479,7 @@ mod tests {
 
     #[test]
     fn slot_index_separates_equal_changes_to_both_key_words() {
-        let index = |name: &[u8]| {
-            let buf = [name, &[0; PADDING]].concat();
-            slot_index(key_words(&buf, 0, name.len()), &[])
-        };
+        let index = |name: &[u8]| slot_index(parse_first_line(&[name, b";1.0\n"].concat()).1, &[]);
         let name = *b"abcdefghijklmnop";
         for i in 0..8 {
             for j in 8..16 {
