@@ -434,6 +434,8 @@ For now, I'm quite happy with the results, and I'll leave it at that (for now?)
 
 Install [Rust](https://rustup.rs/), [samply](https://github.com/mstange/samply) for profiling, [hyperfine](https://github.com/sharkdp/hyperfine) for benchmarks
 
+Alternatively, with [Nix](https://nixos.org/) (flakes enabled), `nix develop` provides all of the above, plus `perf` on Linux.
+
 ### Building the Project
 
 Compile the project in release mode for optimal performance:
