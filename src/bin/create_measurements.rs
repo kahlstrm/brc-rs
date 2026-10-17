@@ -42,7 +42,7 @@ fn main() -> std::io::Result<()> {
             .filter(|count| (1..=MAX_STATIONS).contains(count))
             .unwrap_or_else(|| panic!("Invalid value for <number of stations>: {count}"))
     });
-    let file = File::create(&path)?;
+    let file = File::create(path)?;
     let writer = BufWriter::new(file);
     generate_measurements(size, station_count, Arc::new(Mutex::new(writer)))?;
     Ok(())
@@ -62,8 +62,8 @@ fn generate_measurements<W: Write + Send + 'static>(
     let stations: Arc<[_]> = stations(station_count).into();
     let task_size = size / par_count;
     let mut tasks = vec![task_size; par_count.into()];
-    for i in 0..(size % par_count) {
-        tasks[i] += 1;
+    for task in tasks.iter_mut().take(size % par_count) {
+        *task += 1;
     }
     let tasks = tasks
         .into_iter()
@@ -153,67 +153,11 @@ fn create_measurements<W: Write + Send>(
             write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
             tmp_res.clear();
         }
-        tmp_res.write(&tmp_line)?;
+        tmp_res.write_all(&tmp_line)?;
         tmp_line.clear();
     }
     write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
     Ok(())
-}
-#[cfg(test)]
-mod tests {
-
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
-
-    use crate::generate_measurements;
-    use crate::stations;
-    use crate::MAX_STATIONS;
-    use crate::STATIONS;
-
-    #[test]
-    fn generate_10k() {
-        let thing = Arc::new(Mutex::new(Vec::new()));
-        generate_measurements(10_000, STATIONS.len(), thing.clone()).unwrap();
-        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
-            .expect("should be valid utf-8");
-        assert_eq!(res.lines().count(), 10_000)
-    }
-    #[test]
-    fn generate_random() {
-        let thing = Arc::new(Mutex::new(Vec::new()));
-        generate_measurements(77_123, STATIONS.len(), thing.clone()).unwrap();
-        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
-            .expect("should be valid utf-8");
-        assert_eq!(res.lines().count(), 77_123)
-    }
-    #[test]
-    fn stations_up_to_the_base_list_keep_its_names() {
-        let names: Vec<_> = stations(STATIONS.len())
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert!(names
-            .iter()
-            .zip(STATIONS)
-            .all(|(name, station)| name == station.id));
-    }
-    #[test]
-    fn stations_past_the_base_list_have_names_like_the_challenges_10k_set() {
-        let names: Vec<_> = stations(MAX_STATIONS)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(names.iter().collect::<HashSet<_>>().len(), MAX_STATIONS);
-        assert!(names.iter().all(|name| (1..=100).contains(&name.len())
-            && !name.contains([';', '\n'])
-            && name.trim() == name));
-        // the challenge's own 10K set has 1,543 names over 16 bytes
-        let long = names.iter().filter(|name| name.len() > 16).count();
-        assert!(
-            (1_200..=1_900).contains(&long),
-            "{long} names over 16 bytes"
-        );
-    }
 }
 macro_rules! ws {
     ($id:expr,$measurement:expr) => {
@@ -638,3 +582,60 @@ const STATIONS: &[WeatherStation] = &[
     ws!("Zanzibar City", 26.0),
     ws!("Zürich", 9.3),
 ];
+
+#[cfg(test)]
+mod tests {
+
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    use crate::generate_measurements;
+    use crate::stations;
+    use crate::MAX_STATIONS;
+    use crate::STATIONS;
+
+    #[test]
+    fn generate_10k() {
+        let thing = Arc::new(Mutex::new(Vec::new()));
+        generate_measurements(10_000, STATIONS.len(), thing.clone()).unwrap();
+        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
+            .expect("should be valid utf-8");
+        assert_eq!(res.lines().count(), 10_000)
+    }
+    #[test]
+    fn generate_random() {
+        let thing = Arc::new(Mutex::new(Vec::new()));
+        generate_measurements(77_123, STATIONS.len(), thing.clone()).unwrap();
+        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
+            .expect("should be valid utf-8");
+        assert_eq!(res.lines().count(), 77_123)
+    }
+    #[test]
+    fn stations_up_to_the_base_list_keep_its_names() {
+        let names: Vec<_> = stations(STATIONS.len())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names
+            .iter()
+            .zip(STATIONS)
+            .all(|(name, station)| name == station.id));
+    }
+    #[test]
+    fn stations_past_the_base_list_have_names_like_the_challenges_10k_set() {
+        let names: Vec<_> = stations(MAX_STATIONS)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), MAX_STATIONS);
+        assert!(names.iter().all(|name| (1..=100).contains(&name.len())
+            && !name.contains([';', '\n'])
+            && name.trim() == name));
+        // the challenge's own 10K set has 1,543 names over 16 bytes
+        let long = names.iter().filter(|name| name.len() > 16).count();
+        assert!(
+            (1_200..=1_900).contains(&long),
+            "{long} names over 16 bytes"
+        );
+    }
+}
