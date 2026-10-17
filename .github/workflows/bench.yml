@@ -38,7 +38,9 @@ jobs:
           cargo build --release --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir "$RUNNER_TEMP/base-target"
           echo "BASE_BIN=$RUNNER_TEMP/base-target/release/brc-rs" >> "$GITHUB_ENV"
       - name: Create measurements
-        run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
+        run: |
+          cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
+          cargo r --quiet --bin create_measurements --features=generate --release 200_000_000 measurements-10k.txt 10000
       - name: Install hyperfine
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
@@ -48,17 +50,25 @@ jobs:
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Compare outputs
         run: |
-          "$BASE_BIN" measurements.txt > base.out
-          ./target/release/brc-rs measurements.txt > pr.out
-          if cmp -s base.out pr.out; then echo "IDENTICAL=true"; else echo "IDENTICAL=false"; fi >> "$GITHUB_ENV"
+          identical=true
+          for data in measurements measurements-10k; do
+            "$BASE_BIN" "$data.txt" > "$data-base.out"
+            ./target/release/brc-rs "$data.txt" > "$data-pr.out"
+            cmp -s "$data-base.out" "$data-pr.out" || identical=false
+          done
+          echo "IDENTICAL=$identical" >> "$GITHUB_ENV"
       - name: Benchmark
         run: |
-          hyperfine -N --output=null --warmup 1 --runs 10 \
-            --metrics time_wall_clock,time_cpu,memory_peak_resident \
-            --export-json bench.json \
-            -n base "$BASE_BIN measurements.txt" \
-            -n PR "./target/release/brc-rs measurements.txt"
-          .github/scripts/bench-comment.sh bench.json "$BASE_REF" "$IDENTICAL" > comment.md
+          for data in measurements measurements-10k; do
+            hyperfine -N --output=null --warmup 1 --runs 10 \
+              --metrics time_wall_clock,time_cpu,memory_peak_resident \
+              --export-json "$data.json" \
+              -n base "$BASE_BIN $data.txt" \
+              -n PR "./target/release/brc-rs $data.txt"
+          done
+          .github/scripts/bench-comment.sh "$BASE_REF" "$IDENTICAL" \
+            "1B rows, 413 stations," measurements.json \
+            "200M rows, 10,000 stations," measurements-10k.json > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on PR
         if: github.event.pull_request.head.repo.full_name == github.repository
@@ -76,5 +86,7 @@ jobs:
       - name: Fail if outputs differ
         if: env.IDENTICAL != 'true'
         run: |
-          diff base.out pr.out | head -n 20
+          for data in measurements measurements-10k; do
+            diff "$data-base.out" "$data-pr.out" | head -n 20 || true
+          done
           exit 1

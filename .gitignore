@@ -4,3 +4,4 @@ measurements.out
 profile.json
 test*
 !test*.rs
+/measurements-10k.txt

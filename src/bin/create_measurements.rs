@@ -24,7 +24,7 @@ impl WeatherStation {
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args();
     let Some(size) = args.nth(1) else {
-        eprintln!("Usage: create_measurements <number of records to create>");
+        eprintln!("Usage: create_measurements <number of records to create> [file name] [number of stations, up to {MAX_STATIONS}]");
         std::process::exit(1);
     };
 
@@ -34,14 +34,22 @@ fn main() -> std::io::Result<()> {
         .expect("Invalid value for <number of records to create>");
     let file_name = args.next();
     let path = Path::new(file_name.as_deref().unwrap_or("measurements.txt"));
+    let station_count = args.next().map_or(STATIONS.len(), |count| {
+        count
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=MAX_STATIONS).contains(count))
+            .unwrap_or_else(|| panic!("Invalid value for <number of stations>: {count}"))
+    });
     let file = File::create(&path)?;
     let writer = BufWriter::new(file);
-    generate_measurements(size, Arc::new(Mutex::new(writer)))?;
+    generate_measurements(size, station_count, Arc::new(Mutex::new(writer)))?;
     Ok(())
 }
 
 fn generate_measurements<W: Write + Send + 'static>(
     size: usize,
+    station_count: usize,
     writer: Arc<Mutex<W>>,
 ) -> std::io::Result<()> {
     let start = Instant::now();
@@ -50,6 +58,7 @@ fn generate_measurements<W: Write + Send + 'static>(
         "Starting generating {} measurements with {} threads",
         size, par_count
     );
+    let stations: Arc<[_]> = stations(station_count).into();
     let task_size = size / par_count;
     let mut tasks = vec![task_size; par_count.into()];
     for i in 0..(size % par_count) {
@@ -57,8 +66,10 @@ fn generate_measurements<W: Write + Send + 'static>(
     }
     let tasks = tasks
         .into_iter()
-        .map(|c| (c, writer.clone()))
-        .map(|(count, a_m)| thread::spawn(move || create_measurements(count, a_m)))
+        .map(|c| (c, stations.clone(), writer.clone()))
+        .map(|(count, stations, a_m)| {
+            thread::spawn(move || create_measurements(count, stations, a_m))
+        })
         .collect::<Vec<_>>();
     tasks.into_iter().for_each(|t| t.join().unwrap().unwrap());
     println!(
@@ -69,18 +80,36 @@ fn generate_measurements<W: Write + Send + 'static>(
     Ok(())
 }
 
+/// The most stations the challenge allows
+const MAX_STATIONS: usize = 10_000;
+
+/// The first `count` stations, continuing past the base list with numbered copies of it, e.g. "Abha#1"
+fn stations(count: usize) -> Vec<(String, &'static WeatherStation)> {
+    (0..count)
+        .map(|i| {
+            let base = &STATIONS[i % STATIONS.len()];
+            let name = match i / STATIONS.len() {
+                0 => base.id.to_string(),
+                copy => format!("{}#{copy}", base.id),
+            };
+            (name, base)
+        })
+        .collect()
+}
+
 const TMP_VEC_CAPACITY: usize = 50_000;
 fn create_measurements<W: Write + Send>(
     count: usize,
+    stations: Arc<[(String, &'static WeatherStation)]>,
     write_mutex: Arc<Mutex<W>>,
 ) -> std::io::Result<()> {
     let mut tmp_res = Vec::with_capacity(TMP_VEC_CAPACITY);
     let mut tmp_line = Vec::with_capacity(106);
 
     for _ in 0..count {
-        let station = &STATIONS[thread_rng().gen_range(0..STATIONS.len())];
+        let (name, station) = &stations[thread_rng().gen_range(0..stations.len())];
 
-        writeln!(tmp_line, "{};{:.1}", station.id, station.measurement())?;
+        writeln!(tmp_line, "{};{:.1}", name, station.measurement())?;
         if tmp_line.len() + tmp_res.len() > TMP_VEC_CAPACITY {
             write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
             tmp_res.clear();
@@ -94,14 +123,18 @@ fn create_measurements<W: Write + Send>(
 #[cfg(test)]
 mod tests {
 
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     use crate::generate_measurements;
+    use crate::stations;
+    use crate::MAX_STATIONS;
+    use crate::STATIONS;
 
     #[test]
     fn generate_10k() {
         let thing = Arc::new(Mutex::new(Vec::new()));
-        generate_measurements(10_000, thing.clone()).unwrap();
+        generate_measurements(10_000, STATIONS.len(), thing.clone()).unwrap();
         let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
             .expect("should be valid utf-8");
         assert_eq!(res.lines().count(), 10_000)
@@ -109,10 +142,19 @@ mod tests {
     #[test]
     fn generate_random() {
         let thing = Arc::new(Mutex::new(Vec::new()));
-        generate_measurements(77_123, thing.clone()).unwrap();
+        generate_measurements(77_123, STATIONS.len(), thing.clone()).unwrap();
         let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
             .expect("should be valid utf-8");
         assert_eq!(res.lines().count(), 77_123)
+    }
+    #[test]
+    fn stations_extends_the_base_list_with_unique_names() {
+        let names: HashSet<_> = stations(MAX_STATIONS)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.len(), MAX_STATIONS);
+        assert!(names.contains("Abha") && names.contains("Abha#1"));
     }
 }
 macro_rules! ws {

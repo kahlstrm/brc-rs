@@ -469,6 +469,15 @@ Usage for creating a `measurements-1m.txt` with 1 million measurements
 ./create_measurements.sh 1000000 measurements-1m.txt
 ```
 
+Usage for creating a `measurements-10k.txt` with 200 million measurements over 10,000 stations, the most the challenge allows.
+Stations past the 413 built-in ones are numbered copies of them, e.g. `Abha#1`.
+
+```sh
+./create_measurements.sh 200000000 measurements-10k.txt 10000
+```
+
+Pull requests are benchmarked against their base branch on both the 1 billion row file and this one.
+
 **NOTE**: The file with 1 billion measurements is over 10 GB in size.
 
 ### Profiling
