@@ -45,9 +45,28 @@ fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
 }
 
-/// Branchless parse of a temperature (`-99.9`..`99.9`, one fractional digit) from the 8 bytes starting at it,
-/// returning the value in tenths. Based on merykitty's solution to the original Java challenge.
-fn parse_temperature(word: u64) -> i64 {
+/// Finds the first ';' at or after `start`, checking 8 bytes at a time (SWAR)
+fn find_semicolon(buf: &[u8], start: usize) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const SEMICOLONS: u64 = ONES * b';' as u64;
+    let mut at = start;
+    loop {
+        let x = load_u64(buf, at) ^ SEMICOLONS;
+        // sets the high bit of each zero byte of x, i.e. each ';'.
+        // Only the lowest match is guaranteed to be exact, which is the one we need
+        let matches = x.wrapping_sub(ONES) & !x & HIGH_BITS;
+        if matches != 0 {
+            return at + (matches.trailing_zeros() / 8) as usize;
+        }
+        at += 8;
+    }
+}
+
+/// Branchless parse of a temperature (`-99.9`..`99.9`, one fractional digit) from the 8 bytes starting at it.
+/// Returns the value in tenths and the length of the temperature including the trailing '\n'.
+/// Based on merykitty's solution to the original Java challenge.
+fn parse_temperature(word: u64) -> (i64, usize) {
     // ASCII digits have bit 4 set while '.' and '-' do not: locate the '.', which is at byte 1, 2 or 3
     let dot_bit = (!word & 0x1010_1000).trailing_zeros();
     // all ones if the first byte is '-', zero otherwise
@@ -57,23 +76,18 @@ fn parse_temperature(word: u64) -> i64 {
     let digits = (unsigned << (28 - dot_bit)) & 0x0F_000F_0F00;
     // a single multiplication sums tens * 100 + ones * 10 + tenths into bits 32..42
     let abs = (digits.wrapping_mul(0x640a_0001) >> 32) & 0x3FF;
-    (abs as i64 ^ sign) - sign
+    let value = (abs as i64 ^ sign) - sign;
+    (value, (dot_bit / 8) as usize + 3)
 }
 
-/// Parses the line from `start` to the '\n' at `end`, returning the station name and the measurement
-fn parse_line(buf: &[u8], start: usize, end: usize) -> (&[u8], i64) {
-    // the temperature is at most 5 bytes long, so the ';' is within the last 6 bytes
-    let semicolon = end
-        - 1
-        - buf[start..end]
-            .iter()
-            .rev()
-            .take(6)
-            .position(|&b| b == b';')
-            .unwrap();
+/// Parses the line starting at `start`, returning the station name, the measurement and the line length
+fn parse_line(buf: &[u8], start: usize) -> (&[u8], i64, usize) {
+    let semicolon = find_semicolon(buf, start);
+    let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
     (
         &buf[start..semicolon],
-        parse_temperature(load_u64(buf, semicolon + 1)),
+        measurement,
+        semicolon + 1 + temperature_len - start,
     )
 }
 struct Chunk {
@@ -220,50 +234,53 @@ impl Hasher for CustomHasher {
 // yoink end
 
 const CHUNK_SIZE: usize = 500_000;
+/// Longer than any valid line: 100 bytes of station name, ';', "-99.9" and '\n'
+const MAX_LINE_LEN: usize = 128;
 fn aggregate_measurements(
     mut kontsa: impl Read,
 ) -> HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher> {
     let mut stations = HashMap::with_hasher(BuildCustomHasher::default());
     let mut buf = [0; CHUNK_SIZE + PADDING];
-    let mut bytes_read = kontsa.read(&mut buf[..CHUNK_SIZE]).unwrap();
-    let mut consumed = 0;
+    let mut filled = 0;
     loop {
-        let Some(line_end_idx) = buf[consumed..bytes_read].iter().position(|b| *b == b'\n') else {
-            buf.copy_within(consumed..bytes_read, 0);
-            let remainder = bytes_read - consumed;
-            bytes_read = kontsa.read(&mut buf[remainder..CHUNK_SIZE]).unwrap();
-            // here if we get bytes_read == 0, which means we did not add anything to remaining characters
-            // and as we are here already, we know that there is no valid line
-            if bytes_read == 0 {
-                break;
-            }
-            bytes_read += remainder;
-            consumed = 0;
-            continue;
+        let bytes_read = kontsa.read(&mut buf[filled..CHUNK_SIZE]).unwrap();
+        filled += bytes_read;
+        let at_eof = bytes_read == 0;
+        // Unless at EOF, only parse lines that are guaranteed to end within the buffer
+        let parse_until = if at_eof {
+            filled
+        } else {
+            filled.saturating_sub(MAX_LINE_LEN)
         };
-        let (station_name, measurement) = parse_line(&buf, consumed, consumed + line_end_idx);
-
-        match stations.get_mut(station_name) {
-            None => {
-                stations.insert(
-                    station_name.to_vec(),
-                    WeatherStationStats {
-                        min: measurement,
-                        max: measurement,
-                        sum: measurement,
-                        count: 1,
-                    },
-                );
-            }
-            Some(s) => {
-                s.max = s.max.max(measurement);
-                s.min = s.min.min(measurement);
-                s.count += 1;
-                s.sum += measurement;
-            }
-        };
-        // We have "consumed" one line of input
-        consumed += line_end_idx + 1;
+        let mut consumed = 0;
+        while consumed < parse_until {
+            let (station_name, measurement, line_len) = parse_line(&buf, consumed);
+            match stations.get_mut(station_name) {
+                None => {
+                    stations.insert(
+                        station_name.to_vec(),
+                        WeatherStationStats {
+                            min: measurement,
+                            max: measurement,
+                            sum: measurement,
+                            count: 1,
+                        },
+                    );
+                }
+                Some(s) => {
+                    s.max = s.max.max(measurement);
+                    s.min = s.min.min(measurement);
+                    s.count += 1;
+                    s.sum += measurement;
+                }
+            };
+            consumed += line_len;
+        }
+        if at_eof {
+            break;
+        }
+        buf.copy_within(consumed..filled, 0);
+        filled -= consumed;
     }
     stations
 }
@@ -292,17 +309,19 @@ mod tests {
         thread_count(Some("0".into()), 8);
     }
     /// Parses the first line of `line` followed by another line and padding, as in the read buffer
-    fn parse_first_line(line: &[u8]) -> (&[u8], i64) {
+    fn parse_first_line(line: &[u8]) -> (&[u8], i64, usize) {
         let buf = [line, b"Next;-1.0\n", &[0; PADDING]].concat().leak();
-        let end = buf.iter().position(|&b| b == b'\n').unwrap();
-        parse_line(buf, 0, end)
+        parse_line(buf, 0)
     }
     macro_rules! tst_parse_line {
         ($func:ident,$line:expr,$expected:expr) => {
             #[test]
             fn $func() {
                 let (station, measurement) = $expected;
-                assert_eq!(parse_first_line($line), (station.as_bytes(), measurement))
+                assert_eq!(
+                    parse_first_line($line),
+                    (station.as_bytes(), measurement, $line.len())
+                )
             }
         };
     }
@@ -315,6 +334,11 @@ mod tests {
         parse_line_works_negative_only_decimal,
         b"StationName;-0.3\n",
         ("StationName", -03)
+    );
+    tst_parse_line!(
+        parse_line_works_negative_single_digit,
+        b"StationName;-7.5\n",
+        ("StationName", -75)
     );
     tst_parse_line!(
         parse_line_works_positive_single_digit,
@@ -332,6 +356,11 @@ mod tests {
         ("StationName", 999)
     );
     tst_parse_line!(
+        parse_line_works_negative_minimum,
+        b"StationName;-99.9\n",
+        ("StationName", -999)
+    );
+    tst_parse_line!(
         parse_line_works_multibyte_utf8_name,
         "Søul;12.0\n".as_bytes(),
         ("Søul", 120)
@@ -344,7 +373,7 @@ mod tests {
             let line = format!("{name};-12.3\n");
             assert_eq!(
                 parse_first_line(line.as_bytes()),
-                (name.as_bytes(), -123),
+                (name.as_bytes(), -123, line.len()),
                 "name length {len}"
             );
         }
@@ -357,7 +386,7 @@ mod tests {
             let text = format!("{sign}{}.{}\n", tenths.abs() / 10, tenths.abs() % 10);
             let bytes = [text.as_bytes(), b"Next;"].concat();
             let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-            assert_eq!(parse_temperature(word), tenths, "{text:?}");
+            assert_eq!(parse_temperature(word), (tenths, text.len()), "{text:?}");
         }
     }
 
