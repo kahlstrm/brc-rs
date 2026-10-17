@@ -1,5 +1,6 @@
 use rand::prelude::*;
 use rand_distr::Normal;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -83,18 +84,56 @@ fn generate_measurements<W: Write + Send + 'static>(
 /// The most stations the challenge allows
 const MAX_STATIONS: usize = 10_000;
 
-/// The first `count` stations, continuing past the base list with numbered copies of it, e.g. "Abha#1"
+/// The first `count` stations of the base list, or past its length, `count` stations with names like
+/// those of the challenge's 10K set, each with the mean temperature of a base station
 fn stations(count: usize) -> Vec<(String, &'static WeatherStation)> {
-    (0..count)
-        .map(|i| {
-            let base = &STATIONS[i % STATIONS.len()];
-            let name = match i / STATIONS.len() {
-                0 => base.id.to_string(),
-                copy => format!("{}#{copy}", base.id),
-            };
-            (name, base)
-        })
+    if count <= STATIONS.len() {
+        return STATIONS[..count]
+            .iter()
+            .map(|station| (station.id.to_string(), station))
+            .collect();
+    }
+    synthetic_names(count)
+        .into_iter()
+        .zip(STATIONS.iter().cycle())
         .collect()
+}
+
+/// Names as the challenge's 10K set makes them: slices of the base names joined together, whose lengths
+/// in characters follow a 7th-order curve, giving mostly short names with a long tail up to 100 bytes.
+/// Seeded, so that every run makes the same names
+fn synthetic_names(count: usize) -> Vec<String> {
+    let mut rng = StdRng::seed_from_u64(10_000);
+    let mut source = STATIONS
+        .iter()
+        .flat_map(|station| station.id.chars())
+        .cycle();
+    let mut taken = HashSet::with_capacity(count);
+    let mut names = Vec::with_capacity(count);
+    while names.len() < count {
+        let len = (4.0 + 2500.0 * (rng.gen::<f64>() - 0.372).powi(7)).max(1.0) as usize;
+        let mut name: Vec<char> = source.by_ref().take(len).collect();
+        while name.iter().collect::<String>().len() > 100 {
+            name.pop();
+        }
+        let last = name.len() - 1;
+        for end in [0, last] {
+            if name[end].is_whitespace() {
+                name[end] = source.find(|c| !c.is_whitespace()).unwrap();
+            }
+        }
+        // there are fewer distinct short slices than names needing them, so those grow instead
+        while taken.contains(&name) {
+            let c = source.find(|c| !c.is_whitespace()).unwrap();
+            match name.len() {
+                ..3 => name.push(c),
+                len => name[rng.gen_range(0..len)] = c,
+            }
+        }
+        names.push(name.iter().collect());
+        taken.insert(name);
+    }
+    names
 }
 
 const TMP_VEC_CAPACITY: usize = 50_000;
@@ -148,13 +187,32 @@ mod tests {
         assert_eq!(res.lines().count(), 77_123)
     }
     #[test]
-    fn stations_extends_the_base_list_with_unique_names() {
-        let names: HashSet<_> = stations(MAX_STATIONS)
+    fn stations_up_to_the_base_list_keep_its_names() {
+        let names: Vec<_> = stations(STATIONS.len())
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        assert_eq!(names.len(), MAX_STATIONS);
-        assert!(names.contains("Abha") && names.contains("Abha#1"));
+        assert!(names
+            .iter()
+            .zip(STATIONS)
+            .all(|(name, station)| name == station.id));
+    }
+    #[test]
+    fn stations_past_the_base_list_have_names_like_the_challenges_10k_set() {
+        let names: Vec<_> = stations(MAX_STATIONS)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), MAX_STATIONS);
+        assert!(names.iter().all(|name| (1..=100).contains(&name.len())
+            && !name.contains([';', '\n'])
+            && name.trim() == name));
+        // the challenge's own 10K set has 1,543 names over 16 bytes
+        let long = names.iter().filter(|name| name.len() > 16).count();
+        assert!(
+            (1_200..=1_900).contains(&long),
+            "{long} names over 16 bytes"
+        );
     }
 }
 macro_rules! ws {
