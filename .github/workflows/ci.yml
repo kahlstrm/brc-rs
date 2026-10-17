@@ -42,9 +42,28 @@ jobs:
       - run: cargo test --verbose
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: hyperfine
+      - name: Install hyperfine
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) target=x86_64-unknown-linux-musl ;;
+            macOS-ARM64) target=aarch64-apple-darwin ;;
+            Windows-X64) target=x86_64-pc-windows-msvc ;;
+            *) echo "Unsupported runner: $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          tag=$(gh release view --repo sharkdp/hyperfine --json tagName --jq .tagName)
+          name="hyperfine-$tag-$target"
+          cd "$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then
+            gh release download "$tag" --repo sharkdp/hyperfine --pattern "$name.zip"
+            unzip -q "$name.zip"
+          else
+            gh release download "$tag" --repo sharkdp/hyperfine --pattern "$name.tar.gz"
+            tar -xzf "$name.tar.gz"
+          fi
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
       - name: Build release
         run: cargo build --release
       - name: Benchmark
