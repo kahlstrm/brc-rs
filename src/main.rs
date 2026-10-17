@@ -1,10 +1,9 @@
 use std::{
     collections::HashMap,
     fs::File,
-    hash::{BuildHasherDefault, Hasher},
     io::{BufRead, BufReader, Read, Seek},
     num::NonZeroUsize,
-    ops::{Add, BitXor},
+    ops::Add,
     sync::{Arc, Mutex},
     thread,
 };
@@ -15,6 +14,7 @@ fn main() {
     println!("{res}");
     return;
 }
+#[derive(Clone, Copy, Default)]
 struct WeatherStationStats {
     min: i64,
     max: i64,
@@ -22,6 +22,20 @@ struct WeatherStationStats {
     count: usize,
 }
 impl WeatherStationStats {
+    fn new(measurement: i64) -> Self {
+        WeatherStationStats {
+            min: measurement,
+            max: measurement,
+            sum: measurement,
+            count: 1,
+        }
+    }
+    fn record(&mut self, measurement: i64) {
+        self.min = self.min.min(measurement);
+        self.max = self.max.max(measurement);
+        self.sum += measurement;
+        self.count += 1;
+    }
     fn mean(&self) -> f64 {
         self.sum as f64 / 10.0 / self.count as f64
     }
@@ -38,8 +52,9 @@ impl Add<&mut Self> for WeatherStationStats {
         }
     }
 }
-/// Every 8-byte load starts within the data, so read buffers keep one load width of padding after it
-const PADDING: usize = size_of::<u64>();
+/// Every 8-byte load starts within the data, except a short station name's second key word,
+/// which starts less than 8 bytes past it, so read buffers keep two load widths of padding after it
+const PADDING: usize = 2 * size_of::<u64>();
 
 fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
@@ -187,85 +202,118 @@ fn calc(file_name: Option<String>) -> String {
         + &String::from("}\n")
 }
 
-type BuildCustomHasher = BuildHasherDefault<CustomHasher>;
-
-#[derive(Default, Clone)]
-struct CustomHasher {
-    hash: u64,
-}
-// yoinked from https://docs.rs/rustc-hash/1.1.0/src/rustc_hash/lib.rs.html#76-109
-impl CustomHasher {
-    fn add_to_hash(&mut self, i: u64) {
-        self.hash = self
-            .hash
-            .rotate_left(5)
-            .bitxor(i)
-            .wrapping_mul(0x517cc1b727220a95);
+/// Bytes of a station name stored inline in its slot and compared as two words
+const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
+/// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
+const TABLE_SIZE: usize = 1 << 16;
+/// `KEY_MASKS[n]` keeps the lowest `n` bytes of a little-endian word
+const KEY_MASKS: [u64; 9] = {
+    let mut masks = [0; 9];
+    let mut n = 1;
+    while n <= 8 {
+        masks[n] = u64::MAX >> (64 - 8 * n);
+        n += 1;
     }
+    masks
+};
+
+/// The first `INLINE_KEY_LEN` bytes of the name at `start`, zero-padded
+fn key_words(buf: &[u8], start: usize, len: usize) -> [u64; 2] {
+    [
+        load_u64(buf, start) & KEY_MASKS[len.min(8)],
+        load_u64(buf, start + 8) & KEY_MASKS[len.clamp(8, 16) - 8],
+    ]
 }
-impl Hasher for CustomHasher {
-    fn finish(&self) -> u64 {
-        self.hash
+
+/// Bytes past the inline key only exist for long names, which are rare enough to hash bytewise
+fn slot_index(key: [u64; 2], tail: &[u8]) -> usize {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let hash = tail
+        .iter()
+        .fold(key[0].wrapping_mul(K) ^ key[1], |h, &b| {
+            (h ^ b as u64).wrapping_mul(K).rotate_left(5)
+        })
+        .wrapping_mul(K);
+    (hash >> (64 - TABLE_SIZE.trailing_zeros())) as usize
+}
+
+/// One cache line per station, so a lookup and its update touch a single line
+#[repr(align(64))]
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    key: [u64; 2],
+    /// Zero marks an empty slot, as station names are at least one byte long
+    len: usize,
+    /// Where the bytes past the inline key start in `StationTable::tails`
+    tail_offset: usize,
+    stats: WeatherStationStats,
+}
+
+/// Open-addressing table with linear probing, keyed by station name
+struct StationTable {
+    slots: Box<[Slot; TABLE_SIZE]>,
+    tails: Vec<u8>,
+}
+impl StationTable {
+    fn new() -> Self {
+        StationTable {
+            slots: vec![Slot::default(); TABLE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!()),
+            tails: Vec::new(),
+        }
     }
 
-    fn write(&mut self, mut bytes: &[u8]) {
-        // This clone tries to ensure that the compiler keeps the state in a register instead of memory
-        // https://github.com/rust-lang/rustc-hash/pull/34
-        let mut state = self.clone();
-        while bytes.len() >= 8 {
-            state.add_to_hash(u64::from_ne_bytes(bytes[..8].try_into().unwrap()));
-            bytes = &bytes[8..]
+    /// Records a measurement for `name`, which starts at `start` in `buf`
+    fn record(&mut self, buf: &[u8], start: usize, name: &[u8], measurement: i64) {
+        let len = name.len();
+        let key = key_words(buf, start, len);
+        let tail = name.get(INLINE_KEY_LEN..).unwrap_or_default();
+        let mut i = slot_index(key, tail);
+        loop {
+            let slot = &mut self.slots[i];
+            if slot.key == key
+                && slot.len == len
+                && (tail.is_empty() || self.tails[slot.tail_offset..][..tail.len()] == *tail)
+            {
+                slot.stats.record(measurement);
+                return;
+            }
+            if slot.len == 0 {
+                *slot = Slot {
+                    key,
+                    len,
+                    tail_offset: self.tails.len(),
+                    stats: WeatherStationStats::new(measurement),
+                };
+                self.tails.extend_from_slice(tail);
+                return;
+            }
+            i = (i + 1) % TABLE_SIZE;
         }
-
-        if bytes.len() >= 4 {
-            state.add_to_hash(u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64);
-            bytes = &bytes[4..];
-        }
-        if bytes.len() >= 2 {
-            state.add_to_hash(u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as u64);
-            bytes = &bytes[2..];
-        }
-        if bytes.len() >= 1 {
-            state.add_to_hash(u8::from_ne_bytes(bytes[..1].try_into().unwrap()) as u64);
-        }
-        *self = state;
     }
-}
-// yoink end
 
-fn record(
-    stations: &mut HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher>,
-    station_name: &[u8],
-    measurement: i64,
-) {
-    match stations.get_mut(station_name) {
-        None => {
-            stations.insert(
-                station_name.to_vec(),
-                WeatherStationStats {
-                    min: measurement,
-                    max: measurement,
-                    sum: measurement,
-                    count: 1,
-                },
-            );
-        }
-        Some(s) => {
-            s.max = s.max.max(measurement);
-            s.min = s.min.min(measurement);
-            s.count += 1;
-            s.sum += measurement;
-        }
+    fn into_stations(self) -> Vec<(Vec<u8>, WeatherStationStats)> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.len != 0)
+            .map(|slot| {
+                let inline = slot.key.iter().flat_map(|word| word.to_le_bytes());
+                let tail_len = slot.len.saturating_sub(INLINE_KEY_LEN);
+                let tail = &self.tails[slot.tail_offset..][..tail_len];
+                let name = inline.take(slot.len - tail_len).chain(tail.iter().copied());
+                (name.collect(), slot.stats)
+            })
+            .collect()
     }
 }
 
 const CHUNK_SIZE: usize = 500_000;
 /// Longer than any valid line: 100 bytes of station name, ';', "-99.9" and '\n'
 const MAX_LINE_LEN: usize = 128;
-fn aggregate_measurements(
-    mut kontsa: impl Read,
-) -> HashMap<Vec<u8>, WeatherStationStats, BuildCustomHasher> {
-    let mut stations = HashMap::with_hasher(BuildCustomHasher::default());
+fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
+    let mut stations = StationTable::new();
     let mut buf = [0; CHUNK_SIZE + PADDING];
     let mut filled = 0;
     loop {
@@ -281,7 +329,7 @@ fn aggregate_measurements(
         let mut consumed = 0;
         while consumed < parse_until {
             let (station_name, measurement, line_len) = parse_line(&buf, consumed);
-            record(&mut stations, station_name, measurement);
+            stations.record(&buf, consumed, station_name, measurement);
             consumed += line_len;
         }
         if at_eof {
@@ -290,7 +338,7 @@ fn aggregate_measurements(
         buf.copy_within(consumed..filled, 0);
         filled -= consumed;
     }
-    stations
+    stations.into_stations()
 }
 
 #[cfg(test)]
@@ -298,8 +346,10 @@ mod tests {
     use std::fs::read_to_string;
 
     use crate::calc;
+    use crate::key_words;
     use crate::parse_line;
     use crate::parse_temperature;
+    use crate::slot_index;
     use crate::thread_count;
     use crate::PADDING;
 
@@ -409,6 +459,38 @@ mod tests {
             let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             assert_eq!(parse_temperature(word), (tenths, text.len()), "{text:?}");
         }
+    }
+
+    #[test]
+    fn slot_index_separates_equal_changes_to_both_key_words() {
+        let index = |name: &[u8]| {
+            let buf = [name, &[0; PADDING]].concat();
+            slot_index(key_words(&buf, 0, name.len()), &[])
+        };
+        let name = *b"abcdefghijklmnop";
+        for i in 0..8 {
+            for j in 8..16 {
+                let mut changed = name;
+                changed[i] ^= 3;
+                changed[j] ^= 3;
+                assert_ne!(index(&name), index(&changed), "bytes {i} and {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn calc_separates_long_names_sharing_a_prefix() {
+        let prefix = "p".repeat(16);
+        let long = "q".repeat(100);
+        let input = format!(
+            "{prefix}A;1.0\n{prefix}B;2.0\n{prefix};3.0\n{long};4.0\n{prefix}A;5.0\n{long};-6.0\n"
+        );
+        let path = std::env::temp_dir().join("brc-long-names.txt");
+        std::fs::write(&path, input).unwrap();
+        assert_eq!(
+            calc(Some(path.to_str().unwrap().into())),
+            format!("{{{prefix}=3.0/3.0/3.0, {prefix}A=1.0/3.0/5.0, {prefix}B=2.0/2.0/2.0, {long}=-6.0/-1.0/4.0}}\n")
+        );
     }
 
     macro_rules! tst {
