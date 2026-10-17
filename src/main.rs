@@ -297,6 +297,20 @@ mod tests {
         let end = buf.iter().position(|&b| b == b'\n').unwrap();
         parse_line(buf, 0, end)
     }
+
+    #[test]
+    fn parse_line_stays_in_bounds_at_the_end_of_the_buffer() {
+        for (temperature, expected) in [("1.2", 12), ("-1.2", -12), ("12.3", 123), ("-12.3", -123)]
+        {
+            let buf = [format!("a;{temperature}\n").as_bytes(), &[0; PADDING]].concat();
+            let end = buf.len() - PADDING - 1;
+            assert_eq!(
+                parse_line(&buf, 0, end),
+                (&b"a"[..], expected),
+                "{temperature}"
+            );
+        }
+    }
     macro_rules! tst_parse_line {
         ($func:ident,$line:expr,$expected:expr) => {
             #[test]
