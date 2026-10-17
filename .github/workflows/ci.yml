@@ -26,12 +26,10 @@ jobs:
           - nightly
         os:
           - ubuntu-latest
-          - windows-latest
           - macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Rustup update
-        if: matrix.os != 'windows-latest'
         run: rustup update ${{ matrix.toolchain }}
       - run: rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
@@ -43,36 +41,17 @@ jobs:
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
       - name: Install hyperfine
-        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
-          case "$RUNNER_OS-$RUNNER_ARCH" in
-            Linux-X64) target=x86_64-unknown-linux-musl ;;
-            macOS-ARM64) target=aarch64-apple-darwin ;;
-            Windows-X64) target=x86_64-pc-windows-msvc ;;
-            *) echo "Unsupported runner: $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
-          esac
-          tag=$(gh release view --repo sharkdp/hyperfine --json tagName --jq .tagName)
-          name="hyperfine-$tag-$target"
-          cd "$RUNNER_TEMP"
-          if [ "$RUNNER_OS" = Windows ]; then
-            gh release download "$tag" --repo sharkdp/hyperfine --pattern "$name.zip"
-            unzip -q "$name.zip"
-          else
-            gh release download "$tag" --repo sharkdp/hyperfine --pattern "$name.tar.gz"
-            tar -xzf "$name.tar.gz"
+          if [ "$RUNNER_OS" = Linux ]; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           fi
-          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+          brew install hyperfine
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Build release
         run: cargo build --release
       - name: Benchmark
-        if: matrix.os != 'windows-latest'
         run: |
           python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
           hyperfine --warmup 0 --runs 5 "./target/release/brc-rs"
-      - name: Benchmark
-        if: matrix.os == 'windows-latest'
-        run: |
-          python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
-          hyperfine -S --warmup 0 --runs 5 "target\release\brc-rs.exe"
