@@ -41,7 +41,7 @@ jobs:
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
       - uses: taiki-e/install-action@v2
         with:
-          tool: hyperfine@2.0.0
+          tool: hyperfine
       - name: Build release
         run: cargo build --release
       - name: Benchmark
