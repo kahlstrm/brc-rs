@@ -12,9 +12,7 @@ use std::{
 
 fn main() {
     let file_name = std::env::args().nth(1);
-    let res = calc(file_name);
-    println!("{res}");
-    return;
+    print!("{}", calc(file_name));
 }
 #[derive(Clone, Copy, Default)]
 struct WeatherStationStats {
