@@ -38,8 +38,8 @@ impl Add<&mut Self> for WeatherStationStats {
         }
     }
 }
-/// Read buffers keep this many bytes after the data, so 8-byte loads near the end stay in bounds
-const PADDING: usize = 16;
+/// Every 8-byte load starts within the data, so read buffers keep one load width of padding after it
+const PADDING: usize = size_of::<u64>();
 
 fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
