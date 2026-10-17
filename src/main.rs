@@ -22,14 +22,13 @@ struct WeatherStationStats {
     count: usize,
 }
 impl WeatherStationStats {
-    fn new(measurement: i64) -> Self {
-        WeatherStationStats {
-            min: measurement,
-            max: measurement,
-            sum: measurement,
-            count: 1,
-        }
-    }
+    /// No measurements yet: any measurement replaces its min and max
+    const EMPTY: Self = WeatherStationStats {
+        min: i64::MAX,
+        max: i64::MIN,
+        sum: 0,
+        count: 0,
+    };
     fn record(&mut self, measurement: i64) {
         self.min = self.min.min(measurement);
         self.max = self.max.max(measurement);
@@ -278,27 +277,44 @@ impl StationTable {
 
     /// Records a measurement for `name`, whose first bytes are `key`
     fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
-        let len = name.len();
-        let tail = name.get(INLINE_KEY_LEN..).unwrap_or_default();
+        let slot = if name.len() <= INLINE_KEY_LEN {
+            self.find_slot(key, name.len(), &[])
+        } else {
+            self.find_long_name_slot(key, name)
+        };
+        slot.stats.record(measurement);
+    }
+
+    /// Kept out of line, so that the common path doesn't carry the bytes past the inline key
+    #[cold]
+    #[inline(never)]
+    fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
+        self.find_slot(key, name.len(), &name[INLINE_KEY_LEN..])
+    }
+
+    /// Finds the slot of the name with `key`, `len` and `tail`, claiming an empty one for a new name
+    #[inline(always)]
+    fn find_slot(&mut self, key: [u64; 2], len: usize, tail: &[u8]) -> &mut Slot {
         let mut i = slot_index(key, tail);
         loop {
-            let slot = &mut self.slots[i];
-            if slot.key == key
+            let slot = &self.slots[i];
+            // compared word by word: comparing the arrays at once compiles to a 16-byte load of the key
+            // just stored as two words, which stalls as the stores can't be forwarded to it
+            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0
                 && slot.len == len
                 && (tail.is_empty() || self.tails[slot.tail_offset..][..tail.len()] == *tail)
             {
-                slot.stats.record(measurement);
-                return;
+                return &mut self.slots[i];
             }
             if slot.len == 0 {
-                *slot = Slot {
+                self.slots[i] = Slot {
                     key,
                     len,
                     tail_offset: self.tails.len(),
-                    stats: WeatherStationStats::new(measurement),
+                    stats: WeatherStationStats::EMPTY,
                 };
                 self.tails.extend_from_slice(tail);
-                return;
+                return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
         }
