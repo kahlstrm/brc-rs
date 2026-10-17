@@ -25,7 +25,6 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
-          - macos-13
     steps:
       - uses: actions/checkout@v4
       - name: Rustup update
