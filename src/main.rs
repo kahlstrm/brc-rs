@@ -22,14 +22,13 @@ struct WeatherStationStats {
     count: usize,
 }
 impl WeatherStationStats {
-    fn new(measurement: i64) -> Self {
-        WeatherStationStats {
-            min: measurement,
-            max: measurement,
-            sum: measurement,
-            count: 1,
-        }
-    }
+    /// No measurements yet: any measurement replaces its min and max
+    const EMPTY: Self = WeatherStationStats {
+        min: i64::MAX,
+        max: i64::MIN,
+        sum: 0,
+        count: 0,
+    };
     fn record(&mut self, measurement: i64) {
         self.min = self.min.min(measurement);
         self.max = self.max.max(measurement);
@@ -82,22 +81,24 @@ fn find_semicolon(buf: &[u8], start: usize) -> usize {
     }
 }
 
-/// Keeps the lowest `n` bytes of a little-endian word, for `n` in `0..=8`
-fn low_bytes(word: u64, n: u32) -> u64 {
-    word & u64::MAX.checked_shr(64 - 8 * n).unwrap_or(0)
+/// All ones in the bytes before the first match of `semicolon_matches`, and in every byte if there is none
+fn mask_before_match(matches: u64) -> u64 {
+    // isolating the lowest match bit, at the top of its byte, leaves a single bit at the bottom of that byte
+    (matches.isolate_lowest_one() >> 7).wrapping_sub(1)
 }
 
 /// Finds the ';' ending the station name at `start` and the name's first 16 bytes as zero-padded key words.
 /// Names of up to 16 bytes, nearly all of them, are found without a loop
 fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
     let words = [load_u64(buf, start), load_u64(buf, start + 8)];
+    let matches = words.map(semicolon_matches);
+    let masks = matches.map(mask_before_match);
+    // the second word only belongs to the name if the first has no ';', i.e. its mask has the top bit set
+    let second_mask = masks[1] & ((masks[0] as i64 >> 63) as u64);
+    let key = [words[0] & masks[0], words[1] & second_mask];
     // bytes before the first ';' of each word, 8 if it has none
-    let [first_len, second_len] = words.map(|word| semicolon_matches(word).trailing_zeros() / 8);
+    let [first_len, second_len] = matches.map(|m| m.trailing_zeros() / 8);
     let second_len = if first_len < 8 { 0 } else { second_len };
-    let key = [
-        low_bytes(words[0], first_len),
-        low_bytes(words[1], second_len),
-    ];
     let len = (first_len + second_len) as usize;
     let semicolon = if len < INLINE_KEY_LEN {
         start + len
@@ -278,27 +279,44 @@ impl StationTable {
 
     /// Records a measurement for `name`, whose first bytes are `key`
     fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
-        let len = name.len();
-        let tail = name.get(INLINE_KEY_LEN..).unwrap_or_default();
+        let slot = if name.len() <= INLINE_KEY_LEN {
+            self.find_slot(key, name.len(), &[])
+        } else {
+            self.find_long_name_slot(key, name)
+        };
+        slot.stats.record(measurement);
+    }
+
+    /// Kept out of line, so that the common path doesn't carry the bytes past the inline key
+    #[cold]
+    #[inline(never)]
+    fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
+        self.find_slot(key, name.len(), &name[INLINE_KEY_LEN..])
+    }
+
+    /// Finds the slot of the name with `key`, `len` and `tail`, claiming an empty one for a new name
+    #[inline(always)]
+    fn find_slot(&mut self, key: [u64; 2], len: usize, tail: &[u8]) -> &mut Slot {
         let mut i = slot_index(key, tail);
         loop {
-            let slot = &mut self.slots[i];
-            if slot.key == key
+            let slot = &self.slots[i];
+            // compared word by word: comparing the arrays at once compiles to a 16-byte load of the key
+            // just stored as two words, which stalls as the stores can't be forwarded to it
+            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0
                 && slot.len == len
                 && (tail.is_empty() || self.tails[slot.tail_offset..][..tail.len()] == *tail)
             {
-                slot.stats.record(measurement);
-                return;
+                return &mut self.slots[i];
             }
             if slot.len == 0 {
-                *slot = Slot {
+                self.slots[i] = Slot {
                     key,
                     len,
                     tail_offset: self.tails.len(),
-                    stats: WeatherStationStats::new(measurement),
+                    stats: WeatherStationStats::EMPTY,
                 };
                 self.tails.extend_from_slice(tail);
-                return;
+                return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
         }
@@ -356,8 +374,10 @@ mod tests {
     use std::fs::read_to_string;
 
     use crate::calc;
+    use crate::mask_before_match;
     use crate::parse_line;
     use crate::parse_temperature;
+    use crate::semicolon_matches;
     use crate::slot_index;
     use crate::thread_count;
     use crate::PADDING;
@@ -475,6 +495,16 @@ mod tests {
             let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             assert_eq!(parse_temperature(word), (tenths, text.len()), "{text:?}");
         }
+    }
+
+    #[test]
+    fn mask_before_match_covers_the_bytes_before_the_first_semicolon() {
+        let mask =
+            |bytes: &[u8; 8]| mask_before_match(semicolon_matches(u64::from_le_bytes(*bytes)));
+        assert_eq!(mask(b";bcdefgh"), 0);
+        assert_eq!(mask(b"abc;e;gh"), 0xFF_FFFF);
+        assert_eq!(mask(b"abcdefg;"), 0xFF_FFFF_FFFF_FFFF);
+        assert_eq!(mask(b"abcdefgh"), u64::MAX);
     }
 
     #[test]
