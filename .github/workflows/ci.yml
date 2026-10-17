@@ -40,7 +40,7 @@ jobs:
       - run: cargo test --verbose
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
-      - run: cargo install hyperfine
+      - run: cargo install hyperfine --locked --version 2.0.0
       - name: Build release
         run: cargo build --release
       - name: Benchmark
@@ -52,4 +52,4 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: |
           python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
-          hyperfine --warmup 0 --runs 5 "target\release\brc-rs.exe"
+          hyperfine -S --warmup 0 --runs 5 "target\release\brc-rs.exe"
