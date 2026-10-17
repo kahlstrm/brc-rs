@@ -40,7 +40,9 @@ jobs:
       - run: cargo test --verbose
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
-      - run: cargo install hyperfine --locked --version 2.0.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: hyperfine@2.0.0
       - name: Build release
         run: cargo build --release
       - name: Benchmark
