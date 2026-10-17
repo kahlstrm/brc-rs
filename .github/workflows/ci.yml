@@ -1,7 +1,9 @@
-name: Cargo Build, Test and Bench
+name: CI
 
 on:
   push:
+    branches:
+      - main
     paths-ignore:
       - "*.md"
       - ".gitignore"
@@ -39,19 +41,4 @@ jobs:
       - run: cargo build --verbose
       - run: cargo test --verbose
       - name: Create measurements
-        run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
-      - name: Install hyperfine
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-        run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          fi
-          brew install hyperfine
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
-      - name: Build release
-        run: cargo build --release
-      - name: Benchmark
-        run: |
-          python -c "import platform, os; print('OS:', platform.system(), platform.release(), 'Architecture:', platform.machine(), 'CPU threads:', os.cpu_count())"
-          hyperfine --warmup 0 --runs 5 "./target/release/brc-rs"
+        run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000
