@@ -1,10 +1,16 @@
 {
   description = "One Billion Row Challenge in Rust";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, rust-overlay, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "x86_64-linux"
@@ -16,24 +22,22 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
+          # the same toolchain rustup uses, from rust-toolchain.toml
+          rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         in
         {
           default = pkgs.mkShell {
             packages =
               with pkgs;
               [
-                cargo
-                rustc
-                clippy
-                rustfmt
-                rust-analyzer
+                rust
                 hyperfine
                 samply
               ]
               ++ lib.optionals stdenv.hostPlatform.isLinux [ perf ];
 
-            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
           };
         }
       );
