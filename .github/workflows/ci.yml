@@ -35,6 +35,7 @@ jobs:
           cache-all-crates: true
           shared-key: ${{ matrix.os }}
       - run: cargo build --verbose
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --verbose --all-features
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000
