@@ -38,10 +38,6 @@ jobs:
           # built from inside its worktree, so that Cargo reads the base's own .cargo/config.toml
           (cd "$RUNNER_TEMP/base" && cargo build --release --target-dir "$RUNNER_TEMP/base-target")
           echo "BASE_BIN=$RUNNER_TEMP/base-target/release/brc-rs" >> "$GITHUB_ENV"
-      - name: Create measurements
-        run: |
-          cargo r --quiet --bin create_measurements --features=generate --release 1_000_000_000
-          cargo r --quiet --bin create_measurements --features=generate --release 200_000_000 measurements-10k.txt 10000
       - name: Install hyperfine
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
@@ -49,25 +45,26 @@ jobs:
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install hyperfine
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
-      - name: Compare outputs
+      - name: Benchmark
+        # one dataset at a time, deleting each before the next: both don't fit in the runner's page cache,
+        # and runs that read the file from disk measure the disk instead of the program
         run: |
           identical=true
-          for data in measurements measurements-10k; do
+          for dataset in "measurements 1_000_000_000 413" "measurements-10k 200_000_000 10000"; do
+            read -r data rows stations <<< "$dataset"
+            cargo r --quiet --bin create_measurements --features=generate --release "$rows" "$data.txt" "$stations"
             "$BASE_BIN" "$data.txt" > "$data-base.out"
             ./target/release/brc-rs "$data.txt" > "$data-pr.out"
             cmp -s "$data-base.out" "$data-pr.out" || identical=false
-          done
-          echo "IDENTICAL=$identical" >> "$GITHUB_ENV"
-      - name: Benchmark
-        run: |
-          for data in measurements measurements-10k; do
             hyperfine -N --output=null --warmup 1 --runs 10 \
               --metrics time_wall_clock,time_cpu,memory_peak_resident \
               --export-json "$data.json" \
               -n base "$BASE_BIN $data.txt" \
               -n PR "./target/release/brc-rs $data.txt"
+            rm "$data.txt"
           done
-          .github/scripts/bench-comment.sh "$BASE_REF" "$IDENTICAL" \
+          echo "IDENTICAL=$identical" >> "$GITHUB_ENV"
+          .github/scripts/bench-comment.sh "$BASE_REF" "$identical" \
             "1B rows, 413 stations," measurements.json \
             "200M rows, 10,000 stations," measurements-10k.json > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
