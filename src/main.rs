@@ -1,9 +1,11 @@
+#![feature(portable_simd)]
 use std::{
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader, Read, Seek},
     num::NonZeroUsize,
     ops::Add,
+    simd::{cmp::SimdPartialEq, u8x16},
     sync::{Arc, Mutex},
     thread,
 };
@@ -51,8 +53,8 @@ impl Add<&mut Self> for WeatherStationStats {
         }
     }
 }
-/// Every 8-byte load starts within the data, except a short station name's second key word,
-/// which starts less than 8 bytes past it, so read buffers keep two load widths of padding after it
+/// Every load starts within the data, and the widest one, of a station name's first 16 bytes,
+/// can reach up to 15 bytes past it, so read buffers keep 16 bytes of padding after it
 const PADDING: usize = 2 * size_of::<u64>();
 
 fn load_u64(buf: &[u8], at: usize) -> u64 {
@@ -81,25 +83,16 @@ fn find_semicolon(buf: &[u8], start: usize) -> usize {
     }
 }
 
-/// All ones in the bytes before the first match of `semicolon_matches`, and in every byte if there is none
-fn mask_before_match(matches: u64) -> u64 {
-    // isolating the lowest match bit, at the top of its byte, leaves a single bit at the bottom of that byte
-    (matches.isolate_lowest_one() >> 7).wrapping_sub(1)
-}
-
 /// Finds the ';' ending the station name at `start` and the name's first 16 bytes as zero-padded key words.
-/// Names of up to 16 bytes, nearly all of them, are found without a loop
+/// Names of up to 16 bytes, nearly all of them, are found with a single 16-byte comparison
 fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
-    let words = [load_u64(buf, start), load_u64(buf, start + 8)];
-    let matches = words.map(semicolon_matches);
-    let masks = matches.map(mask_before_match);
-    // the second word only belongs to the name if the first has no ';', i.e. its mask has the top bit set
-    let second_mask = masks[1] & ((masks[0] as i64 >> 63) as u64);
-    let key = [words[0] & masks[0], words[1] & second_mask];
-    // bytes before the first ';' of each word, 8 if it has none
-    let [first_len, second_len] = matches.map(|m| m.trailing_zeros() / 8);
-    let second_len = if first_len < 8 { 0 } else { second_len };
-    let len = (first_len + second_len) as usize;
+    let bytes = u8x16::from_slice(&buf[start..start + INLINE_KEY_LEN]);
+    // bit n is set if byte n is a ';', and bit 16 stands for one past the inline key
+    let semicolons = bytes.simd_eq(u8x16::splat(b';')).to_bitmask() | 1 << INLINE_KEY_LEN;
+    let len = semicolons.trailing_zeros() as usize;
+    let name_mask = u128::MAX >> (8 * (INLINE_KEY_LEN - len));
+    let name = u128::from_le_bytes(bytes.to_array()) & name_mask;
+    let key = [name as u64, (name >> 64) as u64];
     let semicolon = if len < INLINE_KEY_LEN {
         start + len
     } else {
@@ -374,10 +367,8 @@ mod tests {
     use std::fs::read_to_string;
 
     use crate::calc;
-    use crate::mask_before_match;
     use crate::parse_line;
     use crate::parse_temperature;
-    use crate::semicolon_matches;
     use crate::slot_index;
     use crate::thread_count;
     use crate::PADDING;
@@ -495,16 +486,6 @@ mod tests {
             let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             assert_eq!(parse_temperature(word), (tenths, text.len()), "{text:?}");
         }
-    }
-
-    #[test]
-    fn mask_before_match_covers_the_bytes_before_the_first_semicolon() {
-        let mask =
-            |bytes: &[u8; 8]| mask_before_match(semicolon_matches(u64::from_le_bytes(*bytes)));
-        assert_eq!(mask(b";bcdefgh"), 0);
-        assert_eq!(mask(b"abc;e;gh"), 0xFF_FFFF);
-        assert_eq!(mask(b"abcdefg;"), 0xFF_FFFF_FFFF_FFFF);
-        assert_eq!(mask(b"abcdefgh"), u64::MAX);
     }
 
     #[test]
