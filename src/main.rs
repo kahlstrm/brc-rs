@@ -81,22 +81,24 @@ fn find_semicolon(buf: &[u8], start: usize) -> usize {
     }
 }
 
-/// Keeps the lowest `n` bytes of a little-endian word, for `n` in `0..=8`
-fn low_bytes(word: u64, n: u32) -> u64 {
-    word & u64::MAX.checked_shr(64 - 8 * n).unwrap_or(0)
+/// All ones in the bytes before the first match of `semicolon_matches`, and in every byte if there is none
+fn mask_before_match(matches: u64) -> u64 {
+    // isolating the lowest match bit, at the top of its byte, leaves a single bit at the bottom of that byte
+    (matches.isolate_lowest_one() >> 7).wrapping_sub(1)
 }
 
 /// Finds the ';' ending the station name at `start` and the name's first 16 bytes as zero-padded key words.
 /// Names of up to 16 bytes, nearly all of them, are found without a loop
 fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
     let words = [load_u64(buf, start), load_u64(buf, start + 8)];
+    let matches = words.map(semicolon_matches);
+    let masks = matches.map(mask_before_match);
+    // the second word only belongs to the name if the first has no ';', i.e. its mask has the top bit set
+    let second_mask = masks[1] & ((masks[0] as i64 >> 63) as u64);
+    let key = [words[0] & masks[0], words[1] & second_mask];
     // bytes before the first ';' of each word, 8 if it has none
-    let [first_len, second_len] = words.map(|word| semicolon_matches(word).trailing_zeros() / 8);
+    let [first_len, second_len] = matches.map(|m| m.trailing_zeros() / 8);
     let second_len = if first_len < 8 { 0 } else { second_len };
-    let key = [
-        low_bytes(words[0], first_len),
-        low_bytes(words[1], second_len),
-    ];
     let len = (first_len + second_len) as usize;
     let semicolon = if len < INLINE_KEY_LEN {
         start + len
@@ -372,8 +374,10 @@ mod tests {
     use std::fs::read_to_string;
 
     use crate::calc;
+    use crate::mask_before_match;
     use crate::parse_line;
     use crate::parse_temperature;
+    use crate::semicolon_matches;
     use crate::slot_index;
     use crate::thread_count;
     use crate::PADDING;
@@ -491,6 +495,16 @@ mod tests {
             let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             assert_eq!(parse_temperature(word), (tenths, text.len()), "{text:?}");
         }
+    }
+
+    #[test]
+    fn mask_before_match_covers_the_bytes_before_the_first_semicolon() {
+        let mask =
+            |bytes: &[u8; 8]| mask_before_match(semicolon_matches(u64::from_le_bytes(*bytes)));
+        assert_eq!(mask(b";bcdefgh"), 0);
+        assert_eq!(mask(b"abc;e;gh"), 0xFF_FFFF);
+        assert_eq!(mask(b"abcdefg;"), 0xFF_FFFF_FFFF_FFFF);
+        assert_eq!(mask(b"abcdefgh"), u64::MAX);
     }
 
     #[test]
