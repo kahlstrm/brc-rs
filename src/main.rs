@@ -141,14 +141,16 @@ struct Chunk {
     len: usize,
     outer_map: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
 }
+/// Each thread sets up its own station table, which small files don't have enough lines to make up for
+const MIN_BYTES_PER_THREAD: usize = 4 << 20;
 /// One thread is spawned per chunk, so this is both the chunk and the thread count.
-fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
+fn thread_count(brc_threads: Option<String>, parallelism: usize, file_len: usize) -> usize {
     match brc_threads {
         Some(s) => s
             .parse::<NonZeroUsize>()
             .unwrap_or_else(|_| panic!("BRC_THREADS must be a positive integer, got {s:?}"))
             .get(),
-        None => parallelism,
+        None => parallelism.min(file_len / MIN_BYTES_PER_THREAD + 1),
     }
 }
 fn chunk_le_file<T: BufRead + Seek>(
@@ -161,6 +163,7 @@ fn chunk_le_file<T: BufRead + Seek>(
         std::thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1),
+        file_len,
     );
     let chunk_size = file_len / chunk_count + 1;
     // max length of line is 100 bytes station name, ';', '-99.9', '\n'
@@ -380,20 +383,27 @@ mod tests {
     use crate::semicolon_matches;
     use crate::slot_index;
     use crate::thread_count;
+    use crate::MIN_BYTES_PER_THREAD;
     use crate::PADDING;
 
     #[test]
     fn thread_count_defaults_to_parallelism() {
-        assert_eq!(thread_count(None, 8), 8);
+        assert_eq!(thread_count(None, 8, 14_000_000_000), 8);
+    }
+    #[test]
+    fn thread_count_gives_small_files_fewer_threads() {
+        assert_eq!(thread_count(None, 8, 1_000), 1);
+        assert_eq!(thread_count(None, 8, 3 * MIN_BYTES_PER_THREAD), 4);
     }
     #[test]
     fn thread_count_uses_override() {
-        assert_eq!(thread_count(Some("1".into()), 8), 1);
+        assert_eq!(thread_count(Some("1".into()), 8, 14_000_000_000), 1);
+        assert_eq!(thread_count(Some("8".into()), 8, 1_000), 8);
     }
     #[test]
     #[should_panic(expected = "BRC_THREADS must be a positive integer")]
     fn thread_count_rejects_zero() {
-        thread_count(Some("0".into()), 8);
+        thread_count(Some("0".into()), 8, 1_000);
     }
     /// Parses the first line of `line` followed by another line and padding, as in the read buffer
     fn parse_first_line(line: &[u8]) -> (&[u8], [u64; 2], i64, usize) {
