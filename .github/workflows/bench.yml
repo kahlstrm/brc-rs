@@ -35,7 +35,8 @@ jobs:
         run: |
           cargo build --release
           git worktree add "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
-          cargo build --release --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir "$RUNNER_TEMP/base-target"
+          # built from inside its worktree, so that Cargo reads the base's own .cargo/config.toml
+          (cd "$RUNNER_TEMP/base" && cargo build --release --target-dir "$RUNNER_TEMP/base-target")
           echo "BASE_BIN=$RUNNER_TEMP/base-target/release/brc-rs" >> "$GITHUB_ENV"
       - name: Create measurements
         run: |
