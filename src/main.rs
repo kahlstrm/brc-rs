@@ -82,18 +82,30 @@ struct Chunk {
     len: usize,
     outer_map: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
 }
+/// One thread is spawned per chunk, so this is both the chunk and the thread count.
+fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
+    match brc_threads {
+        Some(s) => s
+            .parse::<NonZeroUsize>()
+            .unwrap_or_else(|_| panic!("BRC_THREADS must be a positive integer, got {s:?}"))
+            .get(),
+        // do a sneaky 4x chunks vs available threads to allow OS scheduler to switch between threads,
+        // potentially enabling I/O blocked threads being swapped to threads where I/O is not blocked.
+        // 4 was tested to provide best perf with both M1 Macbook Max and Ryzen 5950x
+        None => parallelism * 4,
+    }
+}
 fn chunk_le_file<T: BufRead + Seek>(
     mut f: T,
     file_len: usize,
     arccimuuteksi: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
 ) -> Vec<Chunk> {
-    let chunk_count = std::thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(1)
-    // do a sneaky 4x chunks vs available threads to allow OS scheduler to switch between threads,
-    // potentially enabling I/O blocked threads being swapped to threads where I/O is not blocked.
-    // 4 was tested to provide best perf with both M1 Macbook Max and Ryzen 5950x
-    * 4;
+    let chunk_count = thread_count(
+        std::env::var("BRC_THREADS").ok(),
+        std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(1),
+    );
     let chunk_size = file_len / chunk_count + 1;
     // max length of line is 100 bytes station name, ';', '-99.9', '\n'
     let mut tmp_arr = Vec::with_capacity(107);
@@ -266,6 +278,21 @@ mod tests {
 
     use crate::calc;
     use crate::parse_line;
+    use crate::thread_count;
+
+    #[test]
+    fn thread_count_defaults_to_4x_parallelism() {
+        assert_eq!(thread_count(None, 8), 32);
+    }
+    #[test]
+    fn thread_count_uses_override() {
+        assert_eq!(thread_count(Some("1".into()), 8), 1);
+    }
+    #[test]
+    #[should_panic(expected = "BRC_THREADS must be a positive integer")]
+    fn thread_count_rejects_zero() {
+        thread_count(Some("0".into()), 8);
+    }
     macro_rules! tst_parse_line {
         ($func:ident,$line:expr,$expected:expr) => {
             #[test]
