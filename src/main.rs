@@ -2,9 +2,9 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
-    ops::Add,
+    ops::{Add, Range},
     simd::{cmp::SimdPartialEq, u8x16},
     thread,
 };
@@ -119,26 +119,6 @@ fn parse_temperature(word: u64) -> (i64, usize) {
     (value, (dot_bit / 8) as usize + 3)
 }
 
-/// Parses the line starting at `start`, returning the station name, its key words, the measurement and the line length
-fn parse_line(buf: &[u8], start: usize) -> (&[u8], [u64; 2], i64, usize) {
-    let (len, key) = parse_name(buf, start);
-    let semicolon = if len < INLINE_KEY_LEN {
-        start + len
-    } else {
-        find_semicolon(buf, start + INLINE_KEY_LEN)
-    };
-    let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
-    (
-        &buf[start..semicolon],
-        key,
-        measurement,
-        semicolon + 1 + temperature_len - start,
-    )
-}
-struct Chunk {
-    start_point: u64,
-    len: usize,
-}
 /// One thread is spawned per chunk, so this is both the chunk and the thread count.
 fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
     match brc_threads {
@@ -149,37 +129,37 @@ fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
         None => parallelism,
     }
 }
-fn chunk_le_file<T: BufRead + Seek>(mut f: T, file_len: usize) -> Vec<Chunk> {
-    let chunk_count = thread_count(
+/// Splits the file into at most `count` ranges of about equal size, each ending after a '\n' or at the file's end
+fn split_file(mut f: impl BufRead + Seek, file_len: u64, count: usize) -> Vec<Range<u64>> {
+    let chunk_size = file_len / count as u64 + 1;
+    let mut rest_of_line = Vec::with_capacity(MAX_LINE_LEN);
+    let mut ranges = Vec::with_capacity(count);
+    let mut start = 0;
+    while start < file_len {
+        let at = start + chunk_size;
+        let end = if at >= file_len {
+            file_len
+        } else {
+            f.seek(SeekFrom::Start(at)).unwrap();
+            rest_of_line.clear();
+            at + f.read_until(b'\n', &mut rest_of_line).unwrap() as u64
+        };
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+fn calc(file_name: Option<String>) -> String {
+    let file_name = file_name.unwrap_or("measurements.txt".into());
+    let f = File::open(&file_name).unwrap();
+    let file_len = f.metadata().unwrap().len();
+    let thread_count = thread_count(
         std::env::var("BRC_THREADS").ok(),
         std::thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1),
     );
-    let chunk_size = file_len / chunk_count + 1;
-    // max length of line is 100 bytes station name, ';', '-99.9', '\n'
-    let mut tmp_arr = Vec::with_capacity(107);
-    let mut res = vec![];
-    let mut cur_start = 0;
-    for _ in 0..chunk_count {
-        f.seek(std::io::SeekFrom::Current(chunk_size as i64))
-            .unwrap();
-        f.read_until(b'\n', &mut tmp_arr).unwrap();
-        let end_pos = f.stream_position().unwrap();
-        res.push(Chunk {
-            start_point: cur_start,
-            len: (end_pos - cur_start) as usize,
-        });
-        tmp_arr.clear();
-        cur_start = end_pos
-    }
-    res
-}
-fn calc(file_name: Option<String>) -> String {
-    let file_name = file_name.unwrap_or("measurements.txt".into());
-    let f = File::open(&file_name).unwrap();
-    let file_len = f.metadata().unwrap().len() as usize;
-    let chunks = chunk_le_file(BufReader::new(f), file_len);
+    let chunks = split_file(BufReader::new(f), file_len, thread_count);
     let stations = thread::scope(|s| {
         let handles = chunks
             .into_iter()
@@ -187,8 +167,8 @@ fn calc(file_name: Option<String>) -> String {
                 let file_name = &file_name;
                 s.spawn(move || {
                     let mut f = File::open(file_name).unwrap();
-                    f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
-                    aggregate_measurements(f.take(c.len as u64))
+                    f.seek(SeekFrom::Start(c.start)).unwrap();
+                    aggregate_measurements(f.take(c.end - c.start))
                 })
             })
             .collect::<Vec<_>>();
@@ -290,16 +270,6 @@ impl StationTable {
         }
     }
 
-    /// Records a measurement for `name`, whose key words are `key`
-    fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
-        let slot = if name.len() < INLINE_KEY_LEN {
-            self.find_short_slot(key, name.len())
-        } else {
-            self.find_long_name_slot(key, name)
-        };
-        slot.stats.record(measurement);
-    }
-
     /// Finds the slot of the name shorter than the inline key with `key` and `len`, claiming an empty one for
     /// a new name. The key alone tells such names apart, as it holds the ';' after the name
     #[inline(always)]
@@ -388,9 +358,27 @@ const LANES: usize = 2;
 
 /// Records the line at `start`, returning where the next one starts
 fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
-    let (station_name, key, measurement, line_len) = parse_line(buf, start);
-    stations.record(key, station_name, measurement);
-    start + line_len
+    let name = parse_name(buf, start);
+    let temperature = parse_temperature(load_u64(buf, start + name.0 + 1));
+    record_parsed_row(buf, stations, start, name, temperature)
+}
+
+/// Records the line at `start`, given what `parse_name` returned for it and the temperature after a name of
+/// that length, which is only right for a name shorter than 16 bytes. Returns where the next line starts
+#[inline(always)]
+fn record_parsed_row(
+    buf: &[u8],
+    stations: &mut StationTable,
+    start: usize,
+    (len, key): (usize, [u64; 2]),
+    (measurement, temperature_len): (i64, usize),
+) -> usize {
+    if len < INLINE_KEY_LEN {
+        stations.find_short_slot(key, len).stats.record(measurement);
+        start + len + 1 + temperature_len
+    } else {
+        record_long_row(buf, stations, start)
+    }
 }
 
 /// `record_row` for a line whose name is at least 16 bytes long, kept out of the side-by-side loop
@@ -435,16 +423,7 @@ fn parse_lanes<const K: usize>(
         let temperatures: [_; K] =
             std::array::from_fn(|i| parse_temperature(load_u64(buf, cursors[i] + names[i].0 + 1)));
         for i in 0..K {
-            let (len, key) = names[i];
-            cursors[i] = if len < INLINE_KEY_LEN {
-                stations
-                    .find_short_slot(key, len)
-                    .stats
-                    .record(temperatures[i].0);
-                cursors[i] + len + 1 + temperatures[i].1
-            } else {
-                record_long_row(buf, stations, cursors[i])
-            };
+            cursors[i] = record_parsed_row(buf, stations, cursors[i], names[i], temperatures[i]);
         }
     }
     for i in 0..K {
@@ -494,10 +473,11 @@ mod tests {
     use crate::calc;
     use crate::long_name_slot_index;
     use crate::parse_lanes;
-    use crate::parse_line;
+    use crate::parse_name;
     use crate::parse_temperature;
     use crate::record_row;
     use crate::slot_index;
+    use crate::split_file;
     use crate::split_lines;
     use crate::thread_count;
     use crate::StationTable;
@@ -517,10 +497,22 @@ mod tests {
     fn thread_count_rejects_zero() {
         thread_count(Some("0".into()), 8);
     }
-    /// Parses the first line of `line` followed by another line and padding, as in the read buffer
-    fn parse_first_line(line: &[u8]) -> (&[u8], [u64; 2], i64, usize) {
-        let buf = [line, b"Next;-1.0\n", &[0; PADDING]].concat().leak();
-        parse_line(buf, 0)
+    /// Records the first line of `buf`, returning its station name, measurement and length
+    fn record_first_row(buf: &[u8]) -> (Vec<u8>, i64, usize) {
+        let mut stations = StationTable::new();
+        let line_len = record_row(buf, &mut stations, 0);
+        let [(name, stats)] = stations.into_stations().try_into().unwrap();
+        (name, stats.sum, line_len)
+    }
+
+    /// Records the first line of `line` followed by another line and padding, as in the read buffer
+    fn record_first_line(line: &[u8]) -> (Vec<u8>, i64, usize) {
+        record_first_row(&[line, b"Next;-1.0\n", &[0; PADDING]].concat())
+    }
+
+    /// The key words of the station `name`
+    fn key_of(name: &[u8]) -> [u64; 2] {
+        parse_name(&[name, b";1.0\n", &[0; PADDING]].concat(), 0).1
     }
 
     #[test]
@@ -530,8 +522,12 @@ mod tests {
             // the last line of a file may lack its '\n', which is the furthest a load reaches
             for line in [format!("a;{temperature}\n"), format!("a;{temperature}")] {
                 let buf = [line.as_bytes(), &[0; PADDING]].concat();
-                let (station, _, measurement, _) = parse_line(&buf, 0);
-                assert_eq!((station, measurement), (&b"a"[..], expected), "{line:?}");
+                let (station, measurement, _) = record_first_row(&buf);
+                assert_eq!(
+                    (&station[..], measurement),
+                    (&b"a"[..], expected),
+                    "{line:?}"
+                );
             }
         }
     }
@@ -540,9 +536,9 @@ mod tests {
             #[test]
             fn $func() {
                 let (station, measurement) = $expected;
-                let (name, _, parsed, line_len) = parse_first_line($line);
+                let (name, parsed, line_len) = record_first_line($line);
                 assert_eq!(
-                    (name, parsed, line_len),
+                    (&name[..], parsed, line_len),
                     (station.as_bytes(), measurement, $line.len())
                 )
             }
@@ -604,8 +600,8 @@ mod tests {
                 u64::from_le_bytes(inline[8..].try_into().unwrap()),
             ];
             assert_eq!(
-                parse_first_line(&line),
-                (&name[..], key, -123, line.len()),
+                (record_first_line(&line), key_of(&name)),
+                ((name, -123, line.len()), key),
                 "name length {len}"
             );
         }
@@ -624,7 +620,7 @@ mod tests {
 
     #[test]
     fn slot_index_separates_equal_changes_to_both_key_words() {
-        let index = |name: &[u8]| slot_index(parse_first_line(&[name, b";1.0\n"].concat()).1);
+        let index = |name: &[u8]| slot_index(key_of(name));
         let name = *b"abcdefghijklmnop";
         for i in 0..8 {
             for j in 8..16 {
@@ -697,12 +693,31 @@ mod tests {
     fn long_name_slot_index_spreads_names_alike_at_both_ends() {
         let names = (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)));
         let slots: std::collections::HashSet<_> = names
-            .map(|name| {
-                let key = parse_first_line(&[name.as_bytes(), b";1.0\n"].concat()).1;
-                long_name_slot_index(key, name.as_bytes())
-            })
+            .map(|name| long_name_slot_index(key_of(name.as_bytes()), name.as_bytes()))
             .collect();
         assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
+    }
+
+    #[test]
+    fn split_file_splits_at_line_starts_into_at_most_count_ranges() {
+        let input: Vec<u8> = (0..50)
+            .flat_map(|i| format!("{}{i};{i}.0\n", "s".repeat(i % 7)).into_bytes())
+            .collect();
+        let len = input.len() as u64;
+        for count in [1, 2, 3, 8, 50, 1000] {
+            let ranges = split_file(std::io::Cursor::new(&input), len, count);
+            assert!(ranges.len() <= count, "{count}: {ranges:?}");
+            assert_eq!(ranges.first().map(|r| r.start), Some(0), "{count}");
+            assert_eq!(ranges.last().map(|r| r.end), Some(len), "{count}");
+            for range in &ranges {
+                assert!(!range.is_empty(), "{count}: {ranges:?}");
+                assert_eq!(input[range.end as usize - 1], b'\n', "{count}: {ranges:?}");
+            }
+            assert!(
+                ranges.windows(2).all(|w| w[0].end == w[1].start),
+                "{count}: {ranges:?}"
+            );
+        }
     }
 
     #[test]
