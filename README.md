@@ -445,6 +445,9 @@ Compile the project in release mode for optimal performance:
 cargo build --release
 ```
 
+`.cargo/config.toml` builds for the CPU of the machine building it (`-C target-cpu=native`), so the binary may not run on other CPUs.
+Setting `RUSTFLAGS` replaces it, e.g. `RUSTFLAGS= cargo build --release` builds for any x86-64 CPU.
+
 ### Running Tests
 
 To run tests, especially designed to handle smaller datasets for quick feedback:

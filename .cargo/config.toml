@@ -1,3 +1,7 @@
 [profile.profiling]
 inherits = "release"
 debug = true
+
+[build]
+# Built and run on the same machine, as challenge entries are, so use every instruction its CPU has and tune for it
+rustflags = ["-C", "target-cpu=native"]
