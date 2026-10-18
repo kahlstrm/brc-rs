@@ -119,22 +119,6 @@ fn parse_temperature(word: u64) -> (i64, usize) {
     (value, (dot_bit / 8) as usize + 3)
 }
 
-/// Parses the line starting at `start`, returning the station name, its key words, the measurement and the line length
-fn parse_line(buf: &[u8], start: usize) -> (&[u8], [u64; 2], i64, usize) {
-    let (len, key) = parse_name(buf, start);
-    let semicolon = if len < INLINE_KEY_LEN {
-        start + len
-    } else {
-        find_semicolon(buf, start + INLINE_KEY_LEN)
-    };
-    let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
-    (
-        &buf[start..semicolon],
-        key,
-        measurement,
-        semicolon + 1 + temperature_len - start,
-    )
-}
 /// One thread is spawned per chunk, so this is both the chunk and the thread count.
 fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
     match brc_threads {
@@ -286,16 +270,6 @@ impl StationTable {
         }
     }
 
-    /// Records a measurement for `name`, whose key words are `key`
-    fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
-        let slot = if name.len() < INLINE_KEY_LEN {
-            self.find_short_slot(key, name.len())
-        } else {
-            self.find_long_name_slot(key, name)
-        };
-        slot.stats.record(measurement);
-    }
-
     /// Finds the slot of the name shorter than the inline key with `key` and `len`, claiming an empty one for
     /// a new name. The key alone tells such names apart, as it holds the ';' after the name
     #[inline(always)]
@@ -384,9 +358,27 @@ const LANES: usize = 2;
 
 /// Records the line at `start`, returning where the next one starts
 fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
-    let (station_name, key, measurement, line_len) = parse_line(buf, start);
-    stations.record(key, station_name, measurement);
-    start + line_len
+    let name = parse_name(buf, start);
+    let temperature = parse_temperature(load_u64(buf, start + name.0 + 1));
+    record_parsed_row(buf, stations, start, name, temperature)
+}
+
+/// Records the line at `start`, given what `parse_name` returned for it and the temperature after a name of
+/// that length, which is only right for a name shorter than 16 bytes. Returns where the next line starts
+#[inline(always)]
+fn record_parsed_row(
+    buf: &[u8],
+    stations: &mut StationTable,
+    start: usize,
+    (len, key): (usize, [u64; 2]),
+    (measurement, temperature_len): (i64, usize),
+) -> usize {
+    if len < INLINE_KEY_LEN {
+        stations.find_short_slot(key, len).stats.record(measurement);
+        start + len + 1 + temperature_len
+    } else {
+        record_long_row(buf, stations, start)
+    }
 }
 
 /// `record_row` for a line whose name is at least 16 bytes long, kept out of the side-by-side loop
@@ -431,16 +423,7 @@ fn parse_lanes<const K: usize>(
         let temperatures: [_; K] =
             std::array::from_fn(|i| parse_temperature(load_u64(buf, cursors[i] + names[i].0 + 1)));
         for i in 0..K {
-            let (len, key) = names[i];
-            cursors[i] = if len < INLINE_KEY_LEN {
-                stations
-                    .find_short_slot(key, len)
-                    .stats
-                    .record(temperatures[i].0);
-                cursors[i] + len + 1 + temperatures[i].1
-            } else {
-                record_long_row(buf, stations, cursors[i])
-            };
+            cursors[i] = record_parsed_row(buf, stations, cursors[i], names[i], temperatures[i]);
         }
     }
     for i in 0..K {
@@ -490,7 +473,7 @@ mod tests {
     use crate::calc;
     use crate::long_name_slot_index;
     use crate::parse_lanes;
-    use crate::parse_line;
+    use crate::parse_name;
     use crate::parse_temperature;
     use crate::record_row;
     use crate::slot_index;
@@ -514,10 +497,22 @@ mod tests {
     fn thread_count_rejects_zero() {
         thread_count(Some("0".into()), 8);
     }
-    /// Parses the first line of `line` followed by another line and padding, as in the read buffer
-    fn parse_first_line(line: &[u8]) -> (&[u8], [u64; 2], i64, usize) {
-        let buf = [line, b"Next;-1.0\n", &[0; PADDING]].concat().leak();
-        parse_line(buf, 0)
+    /// Records the first line of `buf`, returning its station name, measurement and length
+    fn record_first_row(buf: &[u8]) -> (Vec<u8>, i64, usize) {
+        let mut stations = StationTable::new();
+        let line_len = record_row(buf, &mut stations, 0);
+        let [(name, stats)] = stations.into_stations().try_into().unwrap();
+        (name, stats.sum, line_len)
+    }
+
+    /// Records the first line of `line` followed by another line and padding, as in the read buffer
+    fn record_first_line(line: &[u8]) -> (Vec<u8>, i64, usize) {
+        record_first_row(&[line, b"Next;-1.0\n", &[0; PADDING]].concat())
+    }
+
+    /// The key words of the station `name`
+    fn key_of(name: &[u8]) -> [u64; 2] {
+        parse_name(&[name, b";1.0\n", &[0; PADDING]].concat(), 0).1
     }
 
     #[test]
@@ -527,8 +522,12 @@ mod tests {
             // the last line of a file may lack its '\n', which is the furthest a load reaches
             for line in [format!("a;{temperature}\n"), format!("a;{temperature}")] {
                 let buf = [line.as_bytes(), &[0; PADDING]].concat();
-                let (station, _, measurement, _) = parse_line(&buf, 0);
-                assert_eq!((station, measurement), (&b"a"[..], expected), "{line:?}");
+                let (station, measurement, _) = record_first_row(&buf);
+                assert_eq!(
+                    (&station[..], measurement),
+                    (&b"a"[..], expected),
+                    "{line:?}"
+                );
             }
         }
     }
@@ -537,9 +536,9 @@ mod tests {
             #[test]
             fn $func() {
                 let (station, measurement) = $expected;
-                let (name, _, parsed, line_len) = parse_first_line($line);
+                let (name, parsed, line_len) = record_first_line($line);
                 assert_eq!(
-                    (name, parsed, line_len),
+                    (&name[..], parsed, line_len),
                     (station.as_bytes(), measurement, $line.len())
                 )
             }
@@ -601,8 +600,8 @@ mod tests {
                 u64::from_le_bytes(inline[8..].try_into().unwrap()),
             ];
             assert_eq!(
-                parse_first_line(&line),
-                (&name[..], key, -123, line.len()),
+                (record_first_line(&line), key_of(&name)),
+                ((name, -123, line.len()), key),
                 "name length {len}"
             );
         }
@@ -621,7 +620,7 @@ mod tests {
 
     #[test]
     fn slot_index_separates_equal_changes_to_both_key_words() {
-        let index = |name: &[u8]| slot_index(parse_first_line(&[name, b";1.0\n"].concat()).1);
+        let index = |name: &[u8]| slot_index(key_of(name));
         let name = *b"abcdefghijklmnop";
         for i in 0..8 {
             for j in 8..16 {
@@ -694,10 +693,7 @@ mod tests {
     fn long_name_slot_index_spreads_names_alike_at_both_ends() {
         let names = (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)));
         let slots: std::collections::HashSet<_> = names
-            .map(|name| {
-                let key = parse_first_line(&[name.as_bytes(), b";1.0\n"].concat()).1;
-                long_name_slot_index(key, name.as_bytes())
-            })
+            .map(|name| long_name_slot_index(key_of(name.as_bytes()), name.as_bytes()))
             .collect();
         assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
     }
