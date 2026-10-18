@@ -237,6 +237,22 @@ fn slot_index(key: [u64; 2]) -> usize {
     (hash >> (64 - TABLE_SIZE.trailing_zeros())) as usize
 }
 
+/// Slot of `name`, of at least 16 bytes, whose first 16 bytes are the key words `key`.
+/// The bytes past the key are folded in 8 at a time, ending with the last 8, so that every byte counts
+fn long_name_slot_index(key: [u64; 2], name: &[u8]) -> usize {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let (words, _) = name[INLINE_KEY_LEN..].as_chunks::<8>();
+    let last = load_u64(name, name.len() - 8);
+    let rest = words
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
+        .chain([last])
+        .fold(name.len() as u64, |h, word| {
+            (h ^ word).wrapping_mul(K).rotate_left(29)
+        });
+    slot_index([key[0], key[1] ^ rest])
+}
+
 /// Whether names of the same length of at least 16 bytes, whose first 16 bytes are known to match, are equal.
 /// Compared 16 bytes at a time, and by the last 16 bytes for the rest
 fn long_names_match(a: &[u8], b: &[u8]) -> bool {
@@ -315,13 +331,10 @@ impl StationTable {
     }
 
     /// Finds the slot of `name`, of at least 16 bytes, whose first 16 bytes are `key`, claiming an empty one
-    /// for a new name. Hashed by its first 16 bytes, its last 8 and its length, so that names alike at one end
-    /// still spread out
+    /// for a new name. Hashed by all its bytes, see `long_name_slot_index`
     #[inline(always)]
     fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
-        const K: u64 = 0x9e37_79b9_7f4a_7c15;
-        let last = load_u64(name, name.len() - 8).wrapping_mul(K);
-        let mut i = slot_index([key[0] ^ last, key[1] ^ name.len() as u64]);
+        let mut i = long_name_slot_index(key, name);
         loop {
             let slot = &self.slots[i];
             if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0
@@ -484,6 +497,7 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
 mod tests {
 
     use crate::calc;
+    use crate::long_name_slot_index;
     use crate::parse_lanes;
     use crate::parse_line;
     use crate::parse_temperature;
@@ -682,6 +696,18 @@ mod tests {
             (expected.clone(), consumed)
         );
         assert_eq!(parse_in_lanes::<3>(&buf, data.len()), (expected, consumed));
+    }
+
+    #[test]
+    fn long_name_slot_index_spreads_names_alike_at_both_ends() {
+        let names = (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)));
+        let slots: std::collections::HashSet<_> = names
+            .map(|name| {
+                let key = parse_first_line(&[name.as_bytes(), b";1.0\n"].concat()).1;
+                long_name_slot_index(key, name.as_bytes())
+            })
+            .collect();
+        assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
     }
 
     #[test]
