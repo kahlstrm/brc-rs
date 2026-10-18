@@ -115,9 +115,17 @@ fn parse_long_name<const N: usize>(buf: &[u8], start: usize) -> (usize, LongTail
         bits << INLINE_KEY_LEN | chunk.simd_eq(u8x16::splat(b';')).to_bitmask() as u128
     }) | 1 << (N * INLINE_KEY_LEN);
     let tail_len = semicolons.trailing_zeros() as usize;
+    let masks = tail_masks::<N>(tail_len);
+    (
+        INLINE_KEY_LEN + tail_len,
+        std::array::from_fn(|i| chunks[i] & masks[i]),
+    )
+}
+
+/// Masks of the `N` chunks of a long name's tail keeping its first `tail_len` bytes
+fn tail_masks<const N: usize>(tail_len: usize) -> [u8x16; N] {
     let masks = &TAIL_MASKS[LONG_TAIL_LEN - tail_len..][..LONG_TAIL_LEN];
-    let tail = std::array::from_fn(|i| chunks[i] & u8x16::from_slice(&masks[i * INLINE_KEY_LEN..]));
-    (INLINE_KEY_LEN + tail_len, tail)
+    std::array::from_fn(|i| u8x16::from_slice(&masks[i * INLINE_KEY_LEN..]))
 }
 
 /// Branchless parse of a temperature (`-99.9`..`99.9`, one fractional digit) from the 8 bytes starting at it.
@@ -270,13 +278,15 @@ fn long_name_slot_index<const N: usize>(key: [u64; 2], tail: &LongTail<N>) -> us
     slot_index([key[0] ^ mixed[0], key[1] ^ mixed[1]])
 }
 
-/// Whether `stored`, the tail of a name kept in `StationTable::long_names`, starts with `tail`, compared at once
-fn long_tails_match<const N: usize>(stored: &[u8], tail: &LongTail<N>) -> bool {
+/// Whether the first `tail_len` bytes of `stored`, the tail of a name kept in `StationTable::long_names` followed
+/// by whatever is stored after it, are those of `tail`, compared at once
+fn long_tails_match<const N: usize>(stored: &[u8], tail: &LongTail<N>, tail_len: usize) -> bool {
     let differing = tail
         .iter()
         .zip(stored.as_chunks().0)
-        .fold(u8x16::splat(0), |differing, (chunk, stored)| {
-            differing | (chunk ^ u8x16::from_array(*stored))
+        .zip(tail_masks::<N>(tail_len))
+        .fold(u8x16::splat(0), |differing, ((chunk, stored), mask)| {
+            differing | (chunk ^ (u8x16::from_array(*stored) & mask))
         });
     differing == u8x16::splat(0)
 }
@@ -288,7 +298,7 @@ struct Slot {
     key: [u64; 2],
     /// Zero marks an empty slot, as station names are at least one byte long
     len: usize,
-    /// Where a name of at least 16 bytes starts in `StationTable::long_names`, followed by zeros up to 112 bytes
+    /// Where a name of at least 16 bytes starts in `StationTable::long_names`
     long_name_offset: usize,
     stats: WeatherStationStats,
 }
@@ -296,6 +306,8 @@ struct Slot {
 /// Open-addressing table with linear probing, keyed by station name
 struct StationTable {
     slots: Box<[Slot; TABLE_SIZE]>,
+    /// Names of at least 16 bytes one after another, and 96 zeros, so that 96 bytes can be read past any name's
+    /// first 16. Packed rather than each padded to 112 bytes, they take less than half the cache
     long_names: Vec<u8>,
 }
 impl StationTable {
@@ -305,7 +317,7 @@ impl StationTable {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap_or_else(|_| unreachable!()),
-            long_names: Vec::new(),
+            long_names: vec![0; LONG_TAIL_LEN],
         }
     }
 
@@ -336,7 +348,7 @@ impl StationTable {
 
     /// Finds the slot of the name of `len` bytes, at least 16, whose first 16 bytes are `key`, with `tail` after
     /// them up to its end, claiming an empty one for a new name. Hashed by all its bytes, see
-    /// `long_name_slot_index`. A stored name of the same length is zero past `tail` too, so only `tail` is compared
+    /// `long_name_slot_index`. Of a stored name of the same length, only the bytes `tail` keeps are compared
     #[inline(always)]
     fn find_long_name_slot<const N: usize>(
         &mut self,
@@ -352,22 +364,26 @@ impl StationTable {
                     &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..]
                         [..N * INLINE_KEY_LEN],
                     tail,
+                    len - INLINE_KEY_LEN,
                 )
             {
                 return &mut self.slots[i];
             }
             if slot.len == 0 {
+                let offset = self.long_names.len() - LONG_TAIL_LEN;
                 self.slots[i] = Slot {
                     key,
                     len,
-                    long_name_offset: self.long_names.len(),
+                    long_name_offset: offset,
                     stats: WeatherStationStats::EMPTY,
                 };
                 let key_bytes = key.iter().flat_map(|word| word.to_le_bytes());
                 let tail_bytes = tail.iter().flat_map(|chunk| chunk.to_array());
-                let padding = std::iter::repeat_n(0, LONG_TAIL_LEN - N * INLINE_KEY_LEN);
-                self.long_names
-                    .extend(key_bytes.chain(tail_bytes).chain(padding));
+                // the chunks whole, cut at the name's end after: taking `len` bytes copies them one at a time
+                self.long_names.truncate(offset);
+                self.long_names.extend(key_bytes.chain(tail_bytes));
+                self.long_names.truncate(offset + len);
+                self.long_names.resize(offset + len + LONG_TAIL_LEN, 0);
                 return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
