@@ -228,13 +228,18 @@ fn calc(file_name: Option<String>) -> String {
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
 /// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
 const TABLE_SIZE: usize = 1 << 16;
-/// Bytes past the inline key only exist for long names, which are rare enough to hash bytewise
+/// Bytes past the inline key only exist for long names, which are hashed a word at a time:
+/// each step waits for the previous multiplication, which delays the slot lookup by the tail's length
 fn slot_index(key: [u64; 2], tail: &[u8]) -> usize {
     const K: u64 = 0x517c_c1b7_2722_0a95;
     let hash = tail
-        .iter()
-        .fold(key[0].wrapping_mul(K) ^ key[1], |h, &b| {
-            (h ^ b as u64).wrapping_mul(K).rotate_left(5)
+        .chunks(8)
+        .fold(key[0].wrapping_mul(K) ^ key[1], |h, chunk| {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            (h ^ u64::from_le_bytes(word))
+                .wrapping_mul(K)
+                .rotate_left(5)
         })
         .wrapping_mul(K);
     (hash >> (64 - TABLE_SIZE.trailing_zeros())) as usize
