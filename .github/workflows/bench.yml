@@ -35,6 +35,11 @@ jobs:
       - name: Build PR and base
         run: |
           cargo build --release
+          # the variant that maps the file and exits before its worker, as the fastest Java entries do
+          if grep -q '^java-trick' Cargo.toml; then
+            cargo build --release --features java-trick --target-dir target-java-trick
+            echo "TRICK_BIN=$PWD/target-java-trick/release/brc-rs" >> "$GITHUB_ENV"
+          fi
           git worktree add "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
           # built from inside its worktree, so that Cargo reads the base's own .cargo/config.toml
           (cd "$RUNNER_TEMP/base" && rustup toolchain install && cargo build --release --target-dir "$RUNNER_TEMP/base-target")
@@ -68,12 +73,31 @@ jobs:
               --export-json "$data.json" \
               -n base "$BASE_BIN $data.txt" \
               -n PR "./target/release/brc-rs $data.txt"
+            # benchmarks stop timing when the program exits, which can be before a worker process it started does
+            .github/scripts/lifetime.py "PR" 5 ./target/release/brc-rs "$data.txt" > "$data-lifetime.md"
+            if [ -n "${TRICK_BIN:-}" ]; then
+              "$TRICK_BIN" "$data.txt" > "$data-trick.out"
+              [ "$(cat "$data-pr.out")" = "$(cat "$data-trick.out")" ] || identical=false
+              .github/scripts/lifetime.py "PR, java-trick" 5 "$TRICK_BIN" "$data.txt" >> "$data-lifetime.md"
+            fi
             rm "$data.txt"
           done
           echo "IDENTICAL=$identical" >> "$GITHUB_ENV"
-          .github/scripts/bench-comment.sh "$BASE_REF" "$identical" \
-            "1B rows, 413 stations," measurements.json \
-            "200M rows, 10,000 stations," measurements-10k.json > comment.md
+          {
+            .github/scripts/bench-comment.sh "$BASE_REF" "$identical" \
+              "1B rows, 413 stations," measurements.json \
+              "200M rows, 10,000 stations," measurements-10k.json
+            echo
+            echo "#### Until the result and until every process has exited"
+            for data in "measurements:1B rows, 413 stations" "measurements-10k:200M rows, 10,000 stations"; do
+              echo
+              echo "${data#*:}, 5 runs each:"
+              echo
+              echo "| Build | Until the result | Until all processes exit | Hidden |"
+              echo "|---|---:|---:|---:|"
+              cat "${data%%:*}-lifetime.md"
+            done
+          } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on PR
         if: github.event.pull_request.head.repo.full_name == github.repository
