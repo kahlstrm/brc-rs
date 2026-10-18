@@ -88,10 +88,10 @@ fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
     (len, [name as u64, (name >> 64) as u64])
 }
 
-/// Bytes past the first 16 of a station name, which the challenge caps at 100 bytes, rounded up to 16
+/// Bytes of a station name past its first 16, which the challenge caps at 100 bytes, rounded up to 16
 const LONG_TAIL_LEN: usize = 6 * INLINE_KEY_LEN;
-/// The bytes of a long station name past its first 16, zero after the name
-type LongTail = [u8x16; LONG_TAIL_LEN / INLINE_KEY_LEN];
+/// The `N` 16-byte chunks of a long station name after its first 16 bytes, zero past the name
+type LongTail<const N: usize> = [u8x16; N];
 
 /// Masks keeping the first `len` bytes of a long name's tail, at `LONG_TAIL_LEN - len..2 * LONG_TAIL_LEN - len`
 const TAIL_MASKS: [u8; 2 * LONG_TAIL_LEN] = {
@@ -104,14 +104,15 @@ const TAIL_MASKS: [u8; 2 * LONG_TAIL_LEN] = {
     masks
 };
 
-/// The length of the station name of at least 16 bytes at `start`, and its tail. The same work for any length
-/// up to 112 bytes, so that no branch depends on it, as such lengths are evenly spread
-fn parse_long_name(buf: &[u8], start: usize) -> (usize, LongTail) {
-    let bytes = &buf[start + INLINE_KEY_LEN..][..LONG_TAIL_LEN];
-    let chunks: LongTail = std::array::from_fn(|i| u8x16::from_slice(&bytes[i * INLINE_KEY_LEN..]));
+/// The length of the station name of at least 16 bytes at `start`, `16 * (N + 1)` if it is not shorter, and its
+/// tail. The same work for any length: long names' lengths are spread evenly, so branches on them mispredict
+fn parse_long_name<const N: usize>(buf: &[u8], start: usize) -> (usize, LongTail<N>) {
+    let bytes = &buf[start + INLINE_KEY_LEN..][..N * INLINE_KEY_LEN];
+    let chunks: LongTail<N> =
+        std::array::from_fn(|i| u8x16::from_slice(&bytes[i * INLINE_KEY_LEN..]));
     let semicolons = chunks.iter().rev().fold(0, |bits: u128, chunk| {
         bits << INLINE_KEY_LEN | chunk.simd_eq(u8x16::splat(b';')).to_bitmask() as u128
-    }) | 1 << LONG_TAIL_LEN;
+    }) | 1 << (N * INLINE_KEY_LEN);
     let tail_len = semicolons.trailing_zeros() as usize;
     let masks = &TAIL_MASKS[LONG_TAIL_LEN - tail_len..][..LONG_TAIL_LEN];
     let tail = std::array::from_fn(|i| chunks[i] & u8x16::from_slice(&masks[i * INLINE_KEY_LEN..]));
@@ -232,16 +233,16 @@ fn slot_index(key: [u64; 2]) -> usize {
 }
 
 /// Slot of the name of at least 16 bytes whose first 16 bytes are the key words `key`, with `tail` after them.
-/// Every 16 bytes of the tail are folded into the key, shifted by their own amount so that their order counts
-fn long_name_slot_index(key: [u64; 2], tail: &LongTail) -> usize {
-    let folded = tail.iter().fold(u64x2::splat(0), |folded, chunk| {
+/// Every 16 bytes of the tail are folded into the key, shifted by their position so that their order counts
+fn long_name_slot_index<const N: usize>(key: [u64; 2], tail: &LongTail<N>) -> usize {
+    let folded = tail.iter().rev().fold(u64x2::splat(0), |folded, chunk| {
         (folded << 1) ^ u64x2::from_ne_bytes(*chunk)
     });
     slot_index([key[0] ^ folded[0], key[1] ^ folded[1]])
 }
 
-/// Whether `stored`, the tail of a name kept in `StationTable::long_names`, equals `tail`, compared at once
-fn long_tails_match(stored: &[u8], tail: &LongTail) -> bool {
+/// Whether `stored`, the tail of a name kept in `StationTable::long_names`, starts with `tail`, compared at once
+fn long_tails_match<const N: usize>(stored: &[u8], tail: &LongTail<N>) -> bool {
     let differing = tail
         .iter()
         .zip(stored.as_chunks().0)
@@ -305,15 +306,22 @@ impl StationTable {
     }
 
     /// Finds the slot of the name of `len` bytes, at least 16, whose first 16 bytes are `key`, with `tail` after
-    /// them, claiming an empty one for a new name. Hashed by all its bytes, see `long_name_slot_index`
+    /// them up to its end, claiming an empty one for a new name. Hashed by all its bytes, see
+    /// `long_name_slot_index`. A stored name of the same length is zero past `tail` too, so only `tail` is compared
     #[inline(always)]
-    fn find_long_name_slot(&mut self, key: [u64; 2], len: usize, tail: &LongTail) -> &mut Slot {
+    fn find_long_name_slot<const N: usize>(
+        &mut self,
+        key: [u64; 2],
+        len: usize,
+        tail: &LongTail<N>,
+    ) -> &mut Slot {
         let mut i = long_name_slot_index(key, tail);
         loop {
             let slot = &self.slots[i];
             if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) | (slot.len ^ len) as u64 == 0
                 && long_tails_match(
-                    &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..][..LONG_TAIL_LEN],
+                    &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..]
+                        [..N * INLINE_KEY_LEN],
                     tail,
                 )
             {
@@ -328,7 +336,9 @@ impl StationTable {
                 };
                 let key_bytes = key.iter().flat_map(|word| word.to_le_bytes());
                 let tail_bytes = tail.iter().flat_map(|chunk| chunk.to_array());
-                self.long_names.extend(key_bytes.chain(tail_bytes));
+                let padding = std::iter::repeat_n(0, LONG_TAIL_LEN - N * INLINE_KEY_LEN);
+                self.long_names
+                    .extend(key_bytes.chain(tail_bytes).chain(padding));
                 return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
@@ -391,15 +401,34 @@ fn record_parsed_row(
     }
 }
 
-/// `record_row` for a line whose name is at least 16 bytes long, kept out of the side-by-side loop
+/// `record_row` for a line whose name is at least 16 bytes long, kept out of the side-by-side loop.
+/// Names of up to 112 bytes are handled. Those shorter than 32 bytes, all the long names of the challenge's
+/// 413 stations, take a path that only reads their first 32 bytes
 #[cold]
 #[inline(never)]
 fn record_long_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
+    let (len, tail) = parse_long_name::<1>(buf, start);
+    if len < 2 * INLINE_KEY_LEN {
+        record_long_name_row(buf, stations, start, len, &tail)
+    } else {
+        let (len, tail) = parse_long_name::<{ LONG_TAIL_LEN / INLINE_KEY_LEN }>(buf, start);
+        record_long_name_row(buf, stations, start, len, &tail)
+    }
+}
+
+/// Records the line at `start`, whose name of `len` bytes, at least 16, ends within `tail`
+#[inline(always)]
+fn record_long_name_row<const N: usize>(
+    buf: &[u8],
+    stations: &mut StationTable,
+    start: usize,
+    len: usize,
+    tail: &LongTail<N>,
+) -> usize {
     let key = [load_u64(buf, start), load_u64(buf, start + 8)];
-    let (len, tail) = parse_long_name(buf, start);
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     stations
-        .find_long_name_slot(key, len, &tail)
+        .find_long_name_slot(key, len, tail)
         .stats
         .record(measurement);
     start + len + 1 + temperature_len
@@ -706,7 +735,7 @@ mod tests {
         let slots: std::collections::HashSet<_> = names
             .map(|name| {
                 let buf = [name.as_bytes(), b";1.0\n", &[0; PADDING]].concat();
-                long_name_slot_index(key_of(name.as_bytes()), &parse_long_name(&buf, 0).1)
+                long_name_slot_index(key_of(name.as_bytes()), &parse_long_name::<6>(&buf, 0).1)
             })
             .collect();
         assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
