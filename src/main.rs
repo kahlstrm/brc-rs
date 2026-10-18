@@ -360,21 +360,19 @@ const LANES: usize = 2;
 
 /// Records the line at `start`, returning where the next one starts
 fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
-    let name = parse_name(buf, start);
-    let temperature = parse_temperature(load_u64(buf, start + name.0 + 1));
-    record_parsed_row(buf, stations, start, name, temperature)
+    record_named_row(buf, stations, start, parse_name(buf, start))
 }
 
-/// Records the line at `start`, given what `parse_name` returned for it and the temperature after a name of
-/// that length, which is only right for a name shorter than 16 bytes. Returns where the next line starts
+/// Records the line at `start`, given what `parse_name` returned for it. Returns where the next line starts
 #[inline(always)]
-fn record_parsed_row(
+fn record_named_row(
     buf: &[u8],
     stations: &mut StationTable,
     start: usize,
     (len, key): (usize, [u64; 2]),
-    (measurement, temperature_len): (i64, usize),
 ) -> usize {
+    // only right for a name shorter than 16 bytes
+    let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     if len < INLINE_KEY_LEN {
         stations.find_short_slot(key, len).stats.record(measurement);
         start + len + 1 + temperature_len
@@ -412,8 +410,9 @@ fn split_lines<const K: usize>(buf: &[u8], until: usize) -> ([usize; K], [usize;
     (starts, ends)
 }
 
-/// Records the lines of `K` parts side by side, one step at a time across all of them, so that the CPU
-/// overlaps the dependent steps of their rows. Returns where each part's parsing stopped
+/// Records the lines of `K` parts side by side, parsing the names of all of them before recording their rows, so
+/// that the CPU overlaps the dependent steps of their rows. Each row's temperature is only parsed as it is recorded,
+/// which leaves fewer values to keep in registers in between. Returns where each part's parsing stopped
 fn parse_lanes<const K: usize>(
     buf: &[u8],
     stations: &mut StationTable,
@@ -422,10 +421,8 @@ fn parse_lanes<const K: usize>(
 ) -> [usize; K] {
     while (0..K).all(|i| cursors[i] < ends[i]) {
         let names = cursors.map(|at| parse_name(buf, at));
-        let temperatures: [_; K] =
-            std::array::from_fn(|i| parse_temperature(load_u64(buf, cursors[i] + names[i].0 + 1)));
         for i in 0..K {
-            cursors[i] = record_parsed_row(buf, stations, cursors[i], names[i], temperatures[i]);
+            cursors[i] = record_named_row(buf, stations, cursors[i], names[i]);
         }
     }
     for i in 0..K {
