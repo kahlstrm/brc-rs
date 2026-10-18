@@ -354,9 +354,9 @@ const CHUNK_SIZE: usize = 1 << 19;
 const _: () = assert!(CHUNK_SIZE + PADDING <= 1 << 20);
 /// Longer than any valid line: 100 bytes of station name, ';', "-99.9" and '\n'
 const MAX_LINE_LEN: usize = 128;
-/// Parts of the read buffer parsed side by side. Measured: 2 overlaps the steps of two rows well,
-/// 3 gains nothing more, and with 4 their values no longer fit in registers
-const LANES: usize = 2;
+/// Parts of the read buffer parsed side by side. Measured: 3 overlaps the dependent steps of rows better than 2,
+/// and with 4 too many values no longer fit in registers
+const LANES: usize = 3;
 
 /// Records the line at `start`, returning where the next one starts
 fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
