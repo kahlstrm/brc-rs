@@ -206,7 +206,7 @@ fn calc(file_name: Option<String>) -> String {
     let lock = stations.lock().unwrap();
     let mut res = lock.iter().collect::<Vec<_>>();
 
-    res.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    res.sort_unstable_by(|a, b| a.0.cmp(b.0));
     String::from("{")
         + &res
             .into_iter()
@@ -422,7 +422,7 @@ mod tests {
     tst_parse_line!(
         parse_line_works_negative_only_decimal,
         b"StationName;-0.3\n",
-        ("StationName", -03)
+        ("StationName", -3)
     );
     tst_parse_line!(
         parse_line_works_negative_single_digit,
