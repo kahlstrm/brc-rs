@@ -39,7 +39,9 @@ mod java_trick {
         process::{Command, Stdio},
     };
 
-    const WORKER: &str = "BRC_WORKER";
+    /// Set for the worker. Specific enough not to be set by accident, which would make the program print
+    /// its result in the worker's form
+    const WORKER: &str = "BRC_JAVA_TRICK_WORKER";
 
     pub fn is_worker() -> bool {
         std::env::var_os(WORKER).is_some()
@@ -96,7 +98,9 @@ mod java_trick {
     unsafe impl Send for Mmap {}
     unsafe impl Sync for Mmap {}
     impl Mmap {
-        pub fn map(file: &File) -> Mmap {
+        /// # Safety
+        /// The file must not be modified or truncated while mapped, as the mapping hands out its bytes as `&[u8]`
+        pub unsafe fn map(file: &File) -> Mmap {
             let len = file.metadata().unwrap().len() as usize;
             if len == 0 {
                 // mmap rejects empty mappings
@@ -181,34 +185,42 @@ mod java_trick {
         use super::aggregate_mapped;
         use crate::{record_row, StationTable, CHUNK_SIZE, PADDING};
 
-        #[test]
-        fn aggregate_mapped_parses_data_just_over_a_buffer_long() {
-            // more than one buffer of data but less than a whole window, the most a copy can't hold with padding
-            let line = b"Hamburg;12.0\nBulawayo;8.9\nPalembang;38.8\n";
-            let mut data: Vec<u8> = line
-                .iter()
-                .copied()
-                .cycle()
-                .take(CHUNK_SIZE + PADDING / 2)
-                .collect();
+        /// Data of `len` bytes or a little less, ending at a line end, from lines of several lengths
+        fn lines_of_about(len: usize) -> Vec<u8> {
+            let lines =
+                b"Hamburg;12.0\nBulawayo;8.9\nPalembang;38.8\nPetropavlovsk-Kamchatsky;-3.4\n";
+            let mut data: Vec<u8> = lines.iter().copied().cycle().take(len).collect();
             while data.last() != Some(&b'\n') {
                 data.pop();
             }
-            assert!(data.len() > CHUNK_SIZE && data.len() < CHUNK_SIZE + PADDING);
-            let padded = [&data[..], &[0; PADDING]].concat();
-            let mut stations = StationTable::new();
-            let mut start = 0;
-            while start < data.len() {
-                start = record_row(&padded, &mut stations, start);
+            data
+        }
+
+        fn sorted(
+            mut stations: Vec<(Vec<u8>, crate::WeatherStationStats)>,
+        ) -> Vec<(Vec<u8>, crate::WeatherStationStats)> {
+            stations.sort_by(|a, b| a.0.cmp(&b.0));
+            stations
+        }
+
+        #[test]
+        fn aggregate_mapped_matches_parsing_one_line_at_a_time() {
+            let window = CHUNK_SIZE + PADDING;
+            // just over one buffer, which a padded copy can't hold at once; and windows, then a copied tail
+            for len in [CHUNK_SIZE + PADDING / 2, 2 * window + window / 2] {
+                let data = lines_of_about(len);
+                let padded = [&data[..], &[0; PADDING]].concat();
+                let mut stations = StationTable::new();
+                let mut start = 0;
+                while start < data.len() {
+                    start = record_row(&padded, &mut stations, start);
+                }
+                assert_eq!(
+                    sorted(aggregate_mapped(&data, 0, data.len())),
+                    sorted(stations.into_stations()),
+                    "{len} bytes"
+                );
             }
-            let sorted = |mut v: Vec<_>| {
-                v.sort_by(|a: &(Vec<u8>, _), b| a.0.cmp(&b.0));
-                v
-            };
-            assert_eq!(
-                sorted(aggregate_mapped(&data, 0, data.len())),
-                sorted(stations.into_stations())
-            );
         }
     }
 }
@@ -376,8 +388,9 @@ fn calc(file_name: Option<String>) -> String {
     let f = File::open(file_name.to_string()).unwrap();
     let file_len = f.metadata().unwrap().len() as usize;
     let stations = Arc::new(Mutex::new(HashMap::<Vec<u8>, WeatherStationStats>::new()));
+    // SAFETY: the measurements file isn't changed while the program runs, as the challenge assumes
     #[cfg(feature = "java-trick")]
-    let data = Arc::new(java_trick::Mmap::map(&f));
+    let data = Arc::new(unsafe { java_trick::Mmap::map(&f) });
     let chunks = chunk_le_file(BufReader::new(f), file_len, stations.clone());
     let handles = chunks
         .into_iter()

@@ -60,6 +60,7 @@ jobs:
         # and runs that read the file from disk measure the disk instead of the program
         run: |
           identical=true
+          trick_identical=true
           for dataset in "measurements 1_000_000_000 413" "measurements-10k 200_000_000 10000"; do
             read -r data rows stations <<< "$dataset"
             cargo r --quiet --bin create_measurements --features=generate --release "$rows" "$data.txt" "$stations"
@@ -77,12 +78,13 @@ jobs:
             .github/scripts/lifetime.py "PR" 5 ./target/release/brc-rs "$data.txt" > "$data-lifetime.md"
             if [ -n "${TRICK_BIN:-}" ]; then
               "$TRICK_BIN" "$data.txt" > "$data-trick.out"
-              [ "$(cat "$data-pr.out")" = "$(cat "$data-trick.out")" ] || identical=false
+              cmp -s "$data-pr.out" "$data-trick.out" || trick_identical=false
               .github/scripts/lifetime.py "PR, java-trick" 5 "$TRICK_BIN" "$data.txt" >> "$data-lifetime.md"
             fi
             rm "$data.txt"
           done
           echo "IDENTICAL=$identical" >> "$GITHUB_ENV"
+          echo "TRICK_IDENTICAL=$trick_identical" >> "$GITHUB_ENV"
           {
             .github/scripts/bench-comment.sh "$BASE_REF" "$identical" \
               "1B rows, 413 stations," measurements.json \
@@ -97,6 +99,10 @@ jobs:
               echo "|---|---:|---:|---:|"
               cat "${data%%:*}-lifetime.md"
             done
+            if [ "$trick_identical" != true ]; then
+              echo
+              echo "**The java-trick build's output differs from the PR's** ❌"
+            fi
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on PR
@@ -113,9 +119,12 @@ jobs:
             gh pr comment "$PR" --body-file comment.md
           fi
       - name: Fail if outputs differ
-        if: env.IDENTICAL != 'true'
+        if: env.IDENTICAL != 'true' || env.TRICK_IDENTICAL != 'true'
         run: |
           for data in measurements measurements-10k; do
             diff "$data-base.out" "$data-pr.out" | head -n 20 || true
+            if [ -f "$data-trick.out" ]; then
+              diff "$data-pr.out" "$data-trick.out" | head -n 20 || true
+            fi
           done
           exit 1
