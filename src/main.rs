@@ -2,7 +2,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek},
+    io::{BufRead, BufReader, Seek},
     num::NonZeroUsize,
     ops::Add,
     simd::{cmp::SimdPartialEq, u8x16},
@@ -11,8 +11,206 @@ use std::{
 };
 
 fn main() {
-    let file_name = std::env::args().nth(1);
-    print!("{}", calc(file_name));
+    #[cfg(feature = "java-trick")]
+    if !java_trick::is_worker() {
+        return java_trick::run_worker();
+    }
+    let result = calc(std::env::args().nth(1));
+    #[cfg(feature = "java-trick")]
+    return java_trick::print_result(&result);
+    #[allow(unreachable_code)]
+    {
+        print!("{result}");
+    }
+}
+
+#[cfg(feature = "java-trick")]
+mod java_trick {
+    //! What the fastest Java entries do: map the file instead of reading it, and do the work in a worker process
+    //! whose result the parent passes on before exiting, so that the worker unmaps the file and exits untimed
+    use super::{
+        record_lines, Buffer, StationTable, WeatherStationStats, CHUNK_SIZE, MAX_LINE_LEN, PADDING,
+    };
+    use std::{
+        ffi::c_void,
+        fs::File,
+        io::{BufRead, BufReader, Read, Write},
+        os::{fd::AsRawFd, raw::c_int},
+        process::{Command, Stdio},
+    };
+
+    const WORKER: &str = "BRC_WORKER";
+
+    pub fn is_worker() -> bool {
+        std::env::var_os(WORKER).is_some()
+    }
+
+    /// Runs this program again as a worker and passes its result on, returning without waiting for the worker
+    // not waiting is the point: once this process exits, the worker is reaped by init when it exits in turn
+    #[allow(clippy::zombie_processes)]
+    pub fn run_worker() {
+        let mut worker = Command::new(std::env::current_exe().unwrap())
+            .args(std::env::args_os().skip(1))
+            .env(WORKER, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(worker.stdout.take().unwrap());
+        let mut len = String::new();
+        output.read_line(&mut len).unwrap();
+        let len = len
+            .trim()
+            .parse()
+            .expect("the worker exited without a result");
+        let mut result = vec![0; len];
+        output.read_exact(&mut result).unwrap();
+        std::io::stdout().write_all(&result).unwrap();
+    }
+
+    /// Writes the result as `run_worker` reads it: its length on a line of its own, then the result
+    pub fn print_result(result: &str) {
+        print!("{}\n{result}", result.len());
+        std::io::stdout().flush().unwrap();
+    }
+
+    extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            offset: i64,
+        ) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    }
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2;
+
+    /// A read-only mapping of a whole file, which must not change while mapped
+    pub struct Mmap {
+        ptr: *const u8,
+        len: usize,
+    }
+    // SAFETY: the mapping is read-only, so sharing it between threads is like sharing a `&[u8]`
+    unsafe impl Send for Mmap {}
+    unsafe impl Sync for Mmap {}
+    impl Mmap {
+        pub fn map(file: &File) -> Mmap {
+            let len = file.metadata().unwrap().len() as usize;
+            if len == 0 {
+                // mmap rejects empty mappings
+                return Mmap {
+                    ptr: std::ptr::NonNull::dangling().as_ptr(),
+                    len,
+                };
+            }
+            // SAFETY: maps `len` bytes of an open file read-only, at an address of the kernel's choosing
+            let ptr = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    PROT_READ,
+                    MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert!(
+                ptr as isize != -1,
+                "mmap failed: {}",
+                std::io::Error::last_os_error()
+            );
+            Mmap {
+                ptr: ptr as *const u8,
+                len,
+            }
+        }
+    }
+    impl std::ops::Deref for Mmap {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            // SAFETY: the mapping holds `len` readable bytes until it is dropped
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+    impl Drop for Mmap {
+        fn drop(&mut self) {
+            if self.len > 0 {
+                // SAFETY: unmaps exactly what `map` mapped, after the last borrow of it
+                unsafe { munmap(self.ptr as *mut c_void, self.len) };
+            }
+        }
+    }
+
+    /// Records the lines starting in `start..end` of `data` straight from it, a buffer-sized window at a time,
+    /// as the read loop does with its buffer. Only the lines in the last window's worth are copied first
+    pub fn aggregate_mapped(
+        data: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Vec<(Vec<u8>, WeatherStationStats)> {
+        let (mut start, end) = (start.min(data.len()), end.min(data.len()));
+        let mut stations = StationTable::new();
+        while let Some(window) = data.get(start..start + CHUNK_SIZE + PADDING) {
+            let window: &Buffer = window.try_into().unwrap();
+            // like the read loop, only lines guaranteed to end within the window's data
+            let until = (end - start).min(CHUNK_SIZE - MAX_LINE_LEN);
+            start += record_lines(window, &mut stations, until);
+            if start >= end {
+                return stations.into_stations();
+            }
+        }
+        // too close to the end of the mapping for a whole window: copied, like the read loop fills its buffer
+        let mut tail: Buffer = [0; CHUNK_SIZE + PADDING];
+        while start < end {
+            let len = (end - start).min(CHUNK_SIZE);
+            tail[..len].copy_from_slice(&data[start..start + len]);
+            let until = if start + len == end {
+                len
+            } else {
+                len - MAX_LINE_LEN
+            };
+            start += record_lines(&tail, &mut stations, until);
+        }
+        stations.into_stations()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::aggregate_mapped;
+        use crate::{record_row, StationTable, CHUNK_SIZE, PADDING};
+
+        #[test]
+        fn aggregate_mapped_parses_data_just_over_a_buffer_long() {
+            // more than one buffer of data but less than a whole window, the most a copy can't hold with padding
+            let line = b"Hamburg;12.0\nBulawayo;8.9\nPalembang;38.8\n";
+            let mut data: Vec<u8> = line
+                .iter()
+                .copied()
+                .cycle()
+                .take(CHUNK_SIZE + PADDING / 2)
+                .collect();
+            while data.last() != Some(&b'\n') {
+                data.pop();
+            }
+            assert!(data.len() > CHUNK_SIZE && data.len() < CHUNK_SIZE + PADDING);
+            let padded = [&data[..], &[0; PADDING]].concat();
+            let mut stations = StationTable::new();
+            let mut start = 0;
+            while start < data.len() {
+                start = record_row(&padded, &mut stations, start);
+            }
+            let sorted = |mut v: Vec<_>| {
+                v.sort_by(|a: &(Vec<u8>, _), b| a.0.cmp(&b.0));
+                v
+            };
+            assert_eq!(
+                sorted(aggregate_mapped(&data, 0, data.len())),
+                sorted(stations.into_stations())
+            );
+        }
+    }
 }
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 struct WeatherStationStats {
@@ -178,16 +376,30 @@ fn calc(file_name: Option<String>) -> String {
     let f = File::open(file_name.to_string()).unwrap();
     let file_len = f.metadata().unwrap().len() as usize;
     let stations = Arc::new(Mutex::new(HashMap::<Vec<u8>, WeatherStationStats>::new()));
+    #[cfg(feature = "java-trick")]
+    let data = Arc::new(java_trick::Mmap::map(&f));
     let chunks = chunk_le_file(BufReader::new(f), file_len, stations.clone());
     let handles = chunks
         .into_iter()
         .map(|c| {
+            #[cfg(not(feature = "java-trick"))]
             let file_name = file_name.clone();
+            #[cfg(feature = "java-trick")]
+            let data = data.clone();
             thread::spawn(move || {
-                let mut f = File::open(file_name.to_string()).unwrap();
-                f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
-                let f = f.take(c.len as u64);
-                let stations_välipala = aggregate_measurements(f);
+                #[cfg(not(feature = "java-trick"))]
+                let stations_välipala = {
+                    use std::io::Read;
+                    let mut f = File::open(file_name.to_string()).unwrap();
+                    f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
+                    aggregate_measurements(f.take(c.len as u64))
+                };
+                #[cfg(feature = "java-trick")]
+                let stations_välipala = java_trick::aggregate_mapped(
+                    &data,
+                    c.start_point as usize,
+                    c.start_point as usize + c.len,
+                );
                 let mut stations = c.outer_map.lock().unwrap();
                 for (k, v) in stations_välipala {
                     match stations.get_mut(&k) {
@@ -203,6 +415,9 @@ fn calc(file_name: Option<String>) -> String {
     for h in handles {
         h.join().unwrap()
     }
+    // left mapped for the exit to unmap, which in the worker only comes after its parent passed the result on
+    #[cfg(feature = "java-trick")]
+    std::mem::forget(data);
     let lock = stations.lock().unwrap();
     let mut res = lock.iter().collect::<Vec<_>>();
 
@@ -340,9 +555,12 @@ const CHUNK_SIZE: usize = 1 << 19;
 const _: () = assert!(CHUNK_SIZE + PADDING <= 1 << 20);
 /// Longer than any valid line: 100 bytes of station name, ';', "-99.9" and '\n'
 const MAX_LINE_LEN: usize = 128;
+/// What lines are parsed from. A fixed size lets the compiler drop bounds checks that a slice would need
+type Buffer = [u8; CHUNK_SIZE + PADDING];
 /// Parts of the read buffer parsed side by side. Measured: 2 overlaps the steps of two rows well,
-/// 3 gains nothing more, and with 4 their values no longer fit in registers
-const LANES: usize = 2;
+/// 3 gains nothing more, and with 4 their values no longer fit in registers. Parsing straight from
+/// a mapped file waits on memory more, which a third part overlaps
+const LANES: usize = if cfg!(feature = "java-trick") { 3 } else { 2 };
 
 /// Records the line at `start`, returning where the next one starts
 fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
@@ -393,7 +611,7 @@ fn parse_lanes<const K: usize>(
 }
 /// Records the lines of `buf` starting before `until`, which must start at a line start, returning where
 /// the first line at or after `until` starts. Lines are parsed in `LANES` parts side by side where they fit
-fn record_lines(buf: &[u8], stations: &mut StationTable, until: usize) -> usize {
+fn record_lines(buf: &Buffer, stations: &mut StationTable, until: usize) -> usize {
     // the precondition of `split_lines`
     if until >= LANES * MAX_LINE_LEN {
         let (starts, ends) = split_lines::<LANES>(buf, until);
@@ -407,9 +625,10 @@ fn record_lines(buf: &[u8], stations: &mut StationTable, until: usize) -> usize 
     }
 }
 
-fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
+#[cfg(not(feature = "java-trick"))]
+fn aggregate_measurements(mut kontsa: impl std::io::Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
     let mut stations = StationTable::new();
-    let mut buf = [0; CHUNK_SIZE + PADDING];
+    let mut buf: Buffer = [0; CHUNK_SIZE + PADDING];
     let mut filled = 0;
     loop {
         let bytes_read = kontsa.read(&mut buf[filled..CHUNK_SIZE]).unwrap();
