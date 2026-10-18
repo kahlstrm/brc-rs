@@ -66,25 +66,16 @@ fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
 }
 
-/// Sets the high bit of each ';' byte of `word` (SWAR).
-/// Only the lowest match is guaranteed to be exact, which is the one we need
-fn semicolon_matches(word: u64) -> u64 {
-    const ONES: u64 = 0x0101_0101_0101_0101;
-    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
-    const SEMICOLONS: u64 = ONES * b';' as u64;
-    let x = word ^ SEMICOLONS;
-    x.wrapping_sub(ONES) & !x & HIGH_BITS
-}
-
-/// Finds the first ';' at or after `start`, checking 8 bytes at a time
+/// Finds the first ';' at or after `start`, checking 16 bytes at a time
 fn find_semicolon(buf: &[u8], start: usize) -> usize {
     let mut at = start;
     loop {
-        let matches = semicolon_matches(load_u64(buf, at));
+        let bytes = u8x16::from_slice(&buf[at..at + INLINE_KEY_LEN]);
+        let matches = bytes.simd_eq(u8x16::splat(b';')).to_bitmask();
         if matches != 0 {
-            return at + (matches.trailing_zeros() / 8) as usize;
+            return at + matches.trailing_zeros() as usize;
         }
-        at += 8;
+        at += INLINE_KEY_LEN;
     }
 }
 
@@ -246,21 +237,41 @@ fn calc(file_name: Option<String>) -> String {
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
 /// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
 const TABLE_SIZE: usize = 1 << 16;
-/// Bytes past the inline key only exist for long names, which are hashed a word at a time:
-/// each step waits for the previous multiplication, which delays the slot lookup by the tail's length
-fn slot_index(key: [u64; 2], tail: &[u8]) -> usize {
+/// Slot of the name with the key words `key`
+fn slot_index(key: [u64; 2]) -> usize {
     const K: u64 = 0x517c_c1b7_2722_0a95;
-    let hash = tail
-        .chunks(8)
-        .fold(key[0].wrapping_mul(K) ^ key[1], |h, chunk| {
-            let mut word = [0; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            (h ^ u64::from_le_bytes(word))
-                .wrapping_mul(K)
-                .rotate_left(5)
-        })
-        .wrapping_mul(K);
+    let hash = (key[0].wrapping_mul(K) ^ key[1]).wrapping_mul(K);
     (hash >> (64 - TABLE_SIZE.trailing_zeros())) as usize
+}
+
+/// Slot of `name`, of at least 16 bytes, whose first 16 bytes are the key words `key`.
+/// The bytes past the key are folded in 8 at a time, ending with the last 8, so that every byte counts
+fn long_name_slot_index(key: [u64; 2], name: &[u8]) -> usize {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let (words, _) = name[INLINE_KEY_LEN..].as_chunks::<8>();
+    let last = load_u64(name, name.len() - 8);
+    let rest = words
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
+        .chain([last])
+        .fold(name.len() as u64, |h, word| {
+            (h ^ word).wrapping_mul(K).rotate_left(29)
+        });
+    slot_index([key[0], key[1] ^ rest])
+}
+
+/// Whether names of the same length of at least 16 bytes, whose first 16 bytes are known to match, are equal.
+/// Compared 16 bytes at a time, and by the last 16 bytes for the rest
+fn long_names_match(a: &[u8], b: &[u8]) -> bool {
+    let last = |name: &[u8]| u8x16::from_slice(&name[name.len() - INLINE_KEY_LEN..]);
+    let (a_chunks, _) = a[INLINE_KEY_LEN..].as_chunks::<INLINE_KEY_LEN>();
+    let (b_chunks, _) = b[INLINE_KEY_LEN..].as_chunks::<INLINE_KEY_LEN>();
+    let chunk = |bytes: &[u8; INLINE_KEY_LEN]| u8x16::from_array(*bytes);
+    a_chunks
+        .iter()
+        .zip(b_chunks)
+        .all(|(x, y)| chunk(x) == chunk(y))
+        && last(a) == last(b)
 }
 
 /// One cache line per station, so a lookup and its update touch a single line
@@ -270,15 +281,15 @@ struct Slot {
     key: [u64; 2],
     /// Zero marks an empty slot, as station names are at least one byte long
     len: usize,
-    /// Where the bytes past the inline key start in `StationTable::tails`
-    tail_offset: usize,
+    /// Where a name of at least 16 bytes starts in `StationTable::long_names`
+    long_name_offset: usize,
     stats: WeatherStationStats,
 }
 
 /// Open-addressing table with linear probing, keyed by station name
 struct StationTable {
     slots: Box<[Slot; TABLE_SIZE]>,
-    tails: Vec<u8>,
+    long_names: Vec<u8>,
 }
 impl StationTable {
     fn new() -> Self {
@@ -287,11 +298,11 @@ impl StationTable {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap_or_else(|_| unreachable!()),
-            tails: Vec::new(),
+            long_names: Vec::new(),
         }
     }
 
-    /// Records a measurement for `name`, whose first bytes are `key`
+    /// Records a measurement for `name`, whose key words are `key`
     fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
         let slot = if name.len() < INLINE_KEY_LEN {
             self.find_short_slot(key, name.len())
@@ -301,20 +312,15 @@ impl StationTable {
         slot.stats.record(measurement);
     }
 
-    /// Kept out of line, so that the common path doesn't carry the bytes past the inline key
-    #[cold]
-    #[inline(never)]
-    fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
-        self.find_slot(key, name.len(), &name[INLINE_KEY_LEN..])
-    }
-
     /// Finds the slot of the name shorter than the inline key with `key` and `len`, claiming an empty one for
     /// a new name. The key alone tells such names apart, as it holds the ';' after the name
     #[inline(always)]
     fn find_short_slot(&mut self, key: [u64; 2], len: usize) -> &mut Slot {
-        let mut i = slot_index(key, &[]);
+        let mut i = slot_index(key);
         loop {
             let slot = &self.slots[i];
+            // compared word by word: comparing the arrays at once compiles to a 16-byte load of the key
+            // just stored as two words, which stalls as the stores can't be forwarded to it
             if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0 {
                 return &mut self.slots[i];
             }
@@ -322,7 +328,7 @@ impl StationTable {
                 self.slots[i] = Slot {
                     key,
                     len,
-                    tail_offset: 0,
+                    long_name_offset: 0,
                     stats: WeatherStationStats::EMPTY,
                 };
                 return &mut self.slots[i];
@@ -331,28 +337,30 @@ impl StationTable {
         }
     }
 
-    /// Finds the slot of the name with `key`, `len` and `tail`, claiming an empty one for a new name
+    /// Finds the slot of `name`, of at least 16 bytes, whose first 16 bytes are `key`, claiming an empty one
+    /// for a new name. Hashed by all its bytes, see `long_name_slot_index`
     #[inline(always)]
-    fn find_slot(&mut self, key: [u64; 2], len: usize, tail: &[u8]) -> &mut Slot {
-        let mut i = slot_index(key, tail);
+    fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
+        let mut i = long_name_slot_index(key, name);
         loop {
             let slot = &self.slots[i];
-            // compared word by word: comparing the arrays at once compiles to a 16-byte load of the key
-            // just stored as two words, which stalls as the stores can't be forwarded to it
             if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0
-                && slot.len == len
-                && (tail.is_empty() || self.tails[slot.tail_offset..][..tail.len()] == *tail)
+                && slot.len == name.len()
+                && long_names_match(
+                    &self.long_names[slot.long_name_offset..][..name.len()],
+                    name,
+                )
             {
                 return &mut self.slots[i];
             }
             if slot.len == 0 {
                 self.slots[i] = Slot {
                     key,
-                    len,
-                    tail_offset: self.tails.len(),
+                    len: name.len(),
+                    long_name_offset: self.long_names.len(),
                     stats: WeatherStationStats::EMPTY,
                 };
-                self.tails.extend_from_slice(tail);
+                self.long_names.extend_from_slice(name);
                 return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
@@ -364,11 +372,16 @@ impl StationTable {
             .iter()
             .filter(|slot| slot.len != 0)
             .map(|slot| {
-                let inline = slot.key.iter().flat_map(|word| word.to_le_bytes());
-                let tail_len = slot.len.saturating_sub(INLINE_KEY_LEN);
-                let tail = &self.tails[slot.tail_offset..][..tail_len];
-                let name = inline.take(slot.len - tail_len).chain(tail.iter().copied());
-                (name.collect(), slot.stats)
+                let name = if slot.len < INLINE_KEY_LEN {
+                    slot.key
+                        .iter()
+                        .flat_map(|word| word.to_le_bytes())
+                        .take(slot.len)
+                        .collect()
+                } else {
+                    self.long_names[slot.long_name_offset..][..slot.len].to_vec()
+                };
+                (name, slot.stats)
             })
             .collect()
     }
@@ -396,7 +409,14 @@ fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
 #[cold]
 #[inline(never)]
 fn record_long_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
-    record_row(buf, stations, start)
+    let key = [load_u64(buf, start), load_u64(buf, start + 8)];
+    let semicolon = find_semicolon(buf, start + INLINE_KEY_LEN);
+    let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
+    stations
+        .find_long_name_slot(key, &buf[start..semicolon])
+        .stats
+        .record(measurement);
+    semicolon + 1 + temperature_len
 }
 
 /// Splits the lines starting before `until` into `K` parts, which start and end at line starts but the last,
@@ -484,6 +504,7 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
 mod tests {
 
     use crate::calc;
+    use crate::long_name_slot_index;
     use crate::parse_lanes;
     use crate::parse_line;
     use crate::parse_temperature;
@@ -615,7 +636,7 @@ mod tests {
 
     #[test]
     fn slot_index_separates_equal_changes_to_both_key_words() {
-        let index = |name: &[u8]| slot_index(parse_first_line(&[name, b";1.0\n"].concat()).1, &[]);
+        let index = |name: &[u8]| slot_index(parse_first_line(&[name, b";1.0\n"].concat()).1);
         let name = *b"abcdefghijklmnop";
         for i in 0..8 {
             for j in 8..16 {
@@ -682,6 +703,18 @@ mod tests {
             (expected.clone(), consumed)
         );
         assert_eq!(parse_in_lanes::<3>(&buf, data.len()), (expected, consumed));
+    }
+
+    #[test]
+    fn long_name_slot_index_spreads_names_alike_at_both_ends() {
+        let names = (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)));
+        let slots: std::collections::HashSet<_> = names
+            .map(|name| {
+                let key = parse_first_line(&[name.as_bytes(), b";1.0\n"].concat()).1;
+                long_name_slot_index(key, name.as_bytes())
+            })
+            .collect();
+        assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
     }
 
     #[test]
