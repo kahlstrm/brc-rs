@@ -1,12 +1,11 @@
 #![feature(portable_simd)]
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader, Read, Seek},
     num::NonZeroUsize,
     ops::Add,
     simd::{cmp::SimdPartialEq, u8x16},
-    sync::{Arc, Mutex},
     thread,
 };
 
@@ -139,7 +138,6 @@ fn parse_line(buf: &[u8], start: usize) -> (&[u8], [u64; 2], i64, usize) {
 struct Chunk {
     start_point: u64,
     len: usize,
-    outer_map: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
 }
 /// One thread is spawned per chunk, so this is both the chunk and the thread count.
 fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
@@ -151,11 +149,7 @@ fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
         None => parallelism,
     }
 }
-fn chunk_le_file<T: BufRead + Seek>(
-    mut f: T,
-    file_len: usize,
-    arccimuuteksi: Arc<Mutex<HashMap<Vec<u8>, WeatherStationStats>>>,
-) -> Vec<Chunk> {
+fn chunk_le_file<T: BufRead + Seek>(mut f: T, file_len: usize) -> Vec<Chunk> {
     let chunk_count = thread_count(
         std::env::var("BRC_THREADS").ok(),
         std::thread::available_parallelism()
@@ -175,7 +169,6 @@ fn chunk_le_file<T: BufRead + Seek>(
         res.push(Chunk {
             start_point: cur_start,
             len: (end_pos - cur_start) as usize,
-            outer_map: arccimuuteksi.clone(),
         });
         tmp_arr.clear();
         cur_start = end_pos
@@ -183,42 +176,37 @@ fn chunk_le_file<T: BufRead + Seek>(
     res
 }
 fn calc(file_name: Option<String>) -> String {
-    let file_name: Arc<str> = file_name.unwrap_or("measurements.txt".into()).into();
-    let f = File::open(file_name.to_string()).unwrap();
+    let file_name = file_name.unwrap_or("measurements.txt".into());
+    let f = File::open(&file_name).unwrap();
     let file_len = f.metadata().unwrap().len() as usize;
-    let stations = Arc::new(Mutex::new(HashMap::<Vec<u8>, WeatherStationStats>::new()));
-    let chunks = chunk_le_file(BufReader::new(f), file_len, stations.clone());
-    let handles = chunks
-        .into_iter()
-        .map(|c| {
-            let file_name = file_name.clone();
-            thread::spawn(move || {
-                let mut f = File::open(file_name.to_string()).unwrap();
-                f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
-                let f = f.take(c.len as u64);
-                let stations_välipala = aggregate_measurements(f);
-                let mut stations = c.outer_map.lock().unwrap();
-                for (k, v) in stations_välipala {
-                    match stations.get_mut(&k) {
-                        Some(jutska) => *jutska = v + jutska,
-                        None => {
-                            stations.insert(k, v);
-                        }
-                    }
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    for h in handles {
-        h.join().unwrap()
-    }
-    let lock = stations.lock().unwrap();
-    let mut res = lock.iter().collect::<Vec<_>>();
-
-    res.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    String::from("{")
-        + &res
+    let chunks = chunk_le_file(BufReader::new(f), file_len);
+    let stations = thread::scope(|s| {
+        let handles = chunks
             .into_iter()
+            .map(|c| {
+                let file_name = &file_name;
+                s.spawn(move || {
+                    let mut f = File::open(file_name).unwrap();
+                    f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
+                    aggregate_measurements(f.take(c.len as u64))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut stations = BTreeMap::new();
+        for h in handles {
+            let stations_välipala = h.join().unwrap();
+            for (k, v) in stations_välipala {
+                stations
+                    .entry(k)
+                    .and_modify(|jutska| *jutska = v + jutska)
+                    .or_insert(v);
+            }
+        }
+        stations
+    });
+    String::from("{")
+        + &stations
+            .iter()
             .map(|(station, stats)| {
                 format!(
                     "{}={:.1}/{:.1}/{:.1}",
