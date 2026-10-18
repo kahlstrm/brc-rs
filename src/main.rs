@@ -57,9 +57,9 @@ impl Add<&mut Self> for WeatherStationStats {
         }
     }
 }
-/// Every load starts within the data, and the widest one, of a station name's first 16 bytes,
-/// can reach up to 15 bytes past it, so read buffers keep 16 bytes of padding after it
-const PADDING: usize = 2 * size_of::<u64>();
+/// A row's loads end within a line of its start, so read buffers keep a line of padding after the data:
+/// then every row starting within it can be loaded without checking where the data ends
+const PADDING: usize = MAX_LINE_LEN;
 
 fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
@@ -419,6 +419,8 @@ fn parse_lanes<const K: usize>(
     mut cursors: [usize; K],
     ends: [usize; K],
 ) -> [usize; K] {
+    // lets the compiler drop the bounds checks of the rows' loads
+    assert!(ends.iter().all(|&end| end + PADDING <= buf.len()));
     while (0..K).all(|i| cursors[i] < ends[i]) {
         let names = cursors.map(|at| parse_name(buf, at));
         for i in 0..K {
