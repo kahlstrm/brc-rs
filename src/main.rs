@@ -14,7 +14,7 @@ fn main() {
     let file_name = std::env::args().nth(1);
     print!("{}", calc(file_name));
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 struct WeatherStationStats {
     min: i64,
     max: i64,
@@ -340,6 +340,57 @@ const CHUNK_SIZE: usize = 1 << 19;
 const _: () = assert!(CHUNK_SIZE + PADDING <= 1 << 20);
 /// Longer than any valid line: 100 bytes of station name, ';', "-99.9" and '\n'
 const MAX_LINE_LEN: usize = 128;
+/// Parts of the read buffer parsed side by side. Measured: 2 overlaps the steps of two rows well,
+/// 3 gains nothing more, and with 4 their values no longer fit in registers
+const LANES: usize = 2;
+
+/// Records the line at `start`, returning where the next one starts
+fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
+    let (station_name, key, measurement, line_len) = parse_line(buf, start);
+    stations.record(key, station_name, measurement);
+    start + line_len
+}
+
+/// Splits the lines starting before `until` into `K` parts, which start and end at line starts but the last,
+/// which ends at `until` and whose last line may run past it. `buf` must start at a line start, and `until / K`
+/// must exceed the longest valid line, so that each split point has a '\n' after it and before `until`
+fn split_lines<const K: usize>(buf: &[u8], until: usize) -> ([usize; K], [usize; K]) {
+    let starts: [usize; K] = std::array::from_fn(|i| match i {
+        0 => 0,
+        _ => {
+            let at = until * i / K;
+            at + buf[at..].iter().position(|&b| b == b'\n').unwrap() + 1
+        }
+    });
+    let ends = std::array::from_fn(|i| starts.get(i + 1).copied().unwrap_or(until));
+    (starts, ends)
+}
+
+/// Records the lines of `K` parts side by side, one step at a time across all of them, so that the CPU
+/// overlaps the dependent steps of their rows. Returns where each part's parsing stopped
+fn parse_lanes<const K: usize>(
+    buf: &[u8],
+    stations: &mut StationTable,
+    mut cursors: [usize; K],
+    ends: [usize; K],
+) -> [usize; K] {
+    while (0..K).all(|i| cursors[i] < ends[i]) {
+        let names = cursors.map(|at| parse_name(buf, at));
+        let temperatures =
+            names.map(|(semicolon, _)| parse_temperature(load_u64(buf, semicolon + 1)));
+        for i in 0..K {
+            let (semicolon, key) = names[i];
+            stations.record(key, &buf[cursors[i]..semicolon], temperatures[i].0);
+            cursors[i] = semicolon + 1 + temperatures[i].1;
+        }
+    }
+    for i in 0..K {
+        while cursors[i] < ends[i] {
+            cursors[i] = record_row(buf, stations, cursors[i]);
+        }
+    }
+    cursors
+}
 fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
     let mut stations = StationTable::new();
     let mut buf = [0; CHUNK_SIZE + PADDING];
@@ -354,12 +405,17 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
         } else {
             filled.saturating_sub(MAX_LINE_LEN)
         };
-        let mut consumed = 0;
-        while consumed < parse_until {
-            let (station_name, key, measurement, line_len) = parse_line(&buf, consumed);
-            stations.record(key, station_name, measurement);
-            consumed += line_len;
-        }
+        // the precondition of `split_lines`
+        let consumed = if parse_until >= LANES * MAX_LINE_LEN {
+            let (starts, ends) = split_lines::<LANES>(&buf, parse_until);
+            parse_lanes(&buf, &mut stations, starts, ends)[LANES - 1]
+        } else {
+            let mut start = 0;
+            while start < parse_until {
+                start = record_row(&buf, &mut stations, start);
+            }
+            start
+        };
         if at_eof {
             break;
         }
@@ -373,10 +429,15 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
 mod tests {
 
     use crate::calc;
+    use crate::parse_lanes;
     use crate::parse_line;
     use crate::parse_temperature;
+    use crate::record_row;
     use crate::slot_index;
+    use crate::split_lines;
     use crate::thread_count;
+    use crate::StationTable;
+    use crate::WeatherStationStats;
     use crate::PADDING;
 
     #[test]
@@ -506,6 +567,63 @@ mod tests {
                 assert_ne!(index(&name), index(&changed), "bytes {i} and {j}");
             }
         }
+    }
+
+    /// The stations from parsing the lines of `buf` starting before `until` in `K` parts side by side,
+    /// and where parsing stopped
+    fn parse_in_lanes<const K: usize>(
+        buf: &[u8],
+        until: usize,
+    ) -> (Vec<(Vec<u8>, WeatherStationStats)>, usize) {
+        let mut stations = StationTable::new();
+        let (starts, ends) = split_lines::<K>(buf, until);
+        let consumed = parse_lanes(buf, &mut stations, starts, ends)[K - 1];
+        let mut result = stations.into_stations();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        (result, consumed)
+    }
+
+    #[test]
+    fn parse_lanes_matches_parsing_one_line_at_a_time() {
+        let data = std::fs::read("samples/measurements-1m.txt").unwrap();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        // stop mid-way through a line, like the read loop does before refilling its buffer
+        let until = data.len() - 1000;
+        let mut stations = StationTable::new();
+        let mut consumed = 0;
+        while consumed < until {
+            consumed = record_row(&buf, &mut stations, consumed);
+        }
+        let mut expected = stations.into_stations();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            parse_in_lanes::<1>(&buf, until),
+            (expected.clone(), consumed)
+        );
+        assert_eq!(
+            parse_in_lanes::<2>(&buf, until),
+            (expected.clone(), consumed)
+        );
+        assert_eq!(parse_in_lanes::<3>(&buf, until), (expected, consumed));
+    }
+
+    #[test]
+    fn parse_lanes_parses_up_to_a_last_line_without_a_newline() {
+        let data = std::fs::read("samples/measurements-1m.txt").unwrap();
+        let data = data.strip_suffix(b"\n").unwrap();
+        let buf = [data, &[0; PADDING]].concat();
+        let mut stations = StationTable::new();
+        let mut consumed = 0;
+        while consumed < data.len() {
+            consumed = record_row(&buf, &mut stations, consumed);
+        }
+        let mut expected = stations.into_stations();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            parse_in_lanes::<2>(&buf, data.len()),
+            (expected.clone(), consumed)
+        );
+        assert_eq!(parse_in_lanes::<3>(&buf, data.len()), (expected, consumed));
     }
 
     #[test]
