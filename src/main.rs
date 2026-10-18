@@ -232,13 +232,41 @@ fn slot_index(key: [u64; 2]) -> usize {
     (hash >> (64 - TABLE_SIZE.trailing_zeros())) as usize
 }
 
+/// Keys of `long_name_slot_index`, one per 16 bytes of a long name's tail, so that their position counts.
+/// Each 32-bit half has a 0xFF byte, which UTF-8 never has, so that no half of a name's word cancels its key's
+/// to zero, which would leave the other half out of the hash
+const TAIL_KEYS: [u64x2; LONG_TAIL_LEN / INLINE_KEY_LEN] = {
+    let mut keys = [u64x2::from_array([0; 2]); LONG_TAIL_LEN / INLINE_KEY_LEN];
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut i = 0;
+    while i < keys.len() {
+        let mut words = [0; 2];
+        let mut j = 0;
+        while j < 2 {
+            state = state
+                .wrapping_mul(0x5851_f42d_4c95_7f2d)
+                .wrapping_add(0x1405_7b7e_f767_814f);
+            words[j] = state ^ (state >> 29) | 0xFF_0000_00FF;
+            j += 1;
+        }
+        keys[i] = u64x2::from_array(words);
+        i += 1;
+    }
+    keys
+};
+
 /// Slot of the name of at least 16 bytes whose first 16 bytes are the key words `key`, with `tail` after them.
-/// Every 16 bytes of the tail are folded into the key, shifted by their position so that their order counts
+/// The tail's words, each xored with its key, are mixed by multiplying their two 32-bit halves, as in the NH hash:
+/// the products don't depend on one another, and a single SSE2 instruction multiplies those of two words at once
 fn long_name_slot_index<const N: usize>(key: [u64; 2], tail: &LongTail<N>) -> usize {
-    let folded = tail.iter().rev().fold(u64x2::splat(0), |folded, chunk| {
-        (folded << 1) ^ u64x2::from_ne_bytes(*chunk)
-    });
-    slot_index([key[0] ^ folded[0], key[1] ^ folded[1]])
+    let mixed = tail
+        .iter()
+        .zip(TAIL_KEYS)
+        .fold(u64x2::splat(0), |sum, (chunk, chunk_key)| {
+            let words = u64x2::from_ne_bytes(*chunk) ^ chunk_key;
+            sum + (words & u64x2::splat(0xFFFF_FFFF)) * (words >> 32)
+        });
+    slot_index([key[0] ^ mixed[0], key[1] ^ mixed[1]])
 }
 
 /// Whether `stored`, the tail of a name kept in `StationTable::long_names`, starts with `tail`, compared at once
@@ -729,16 +757,40 @@ mod tests {
         assert_eq!(parse_in_lanes::<3>(&buf, data.len()), (expected, consumed));
     }
 
-    #[test]
-    fn long_name_slot_index_spreads_names_alike_at_both_ends() {
-        let names = (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)));
+    /// How many slots `long_name_slot_index` spreads the station `names` over
+    fn long_name_slot_count(names: impl Iterator<Item = Vec<u8>>) -> usize {
         let slots: std::collections::HashSet<_> = names
             .map(|name| {
-                let buf = [name.as_bytes(), b";1.0\n", &[0; PADDING]].concat();
-                long_name_slot_index(key_of(name.as_bytes()), &parse_long_name::<6>(&buf, 0).1)
+                let buf = [&name[..], b";1.0\n", &[0; PADDING]].concat();
+                long_name_slot_index(key_of(&name), &parse_long_name::<6>(&buf, 0).1)
             })
             .collect();
-        assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
+        slots.len()
+    }
+
+    #[test]
+    fn long_name_slot_index_spreads_names_alike_at_both_ends() {
+        let names =
+            (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)).into_bytes());
+        let slots = long_name_slot_count(names);
+        assert!(slots > 9_000, "{slots} distinct slots");
+    }
+
+    #[test]
+    fn long_name_slot_index_spreads_names_differing_in_bits_of_adjacent_chunks() {
+        for chunk in 0..4 {
+            // a bit of one 16-byte chunk of the tail flipped together with the bit below it in the next one
+            let names = (0..10_000).map(|i: u32| {
+                let mut name = b"a".repeat(96);
+                for byte in (0..14).filter(|byte| i >> byte & 1 == 1) {
+                    name[16 * (chunk + 1) + byte] ^= 2;
+                    name[16 * (chunk + 2) + byte] ^= 1;
+                }
+                name
+            });
+            let slots = long_name_slot_count(names);
+            assert!(slots > 9_000, "chunk {chunk}: {slots} distinct slots");
+        }
     }
 
     #[test]
