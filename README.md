@@ -471,7 +471,7 @@ Usage for creating a `measurements-1m.txt` with 1 million measurements
 ```
 
 Usage for creating a `measurements-10k.txt` with 200 million measurements over 10,000 stations, the most the challenge allows.
-Stations past the 413 built-in ones are numbered copies of them, e.g. `Abha#1`.
+Past the 413 built-in stations, names are made like those of the challenge's own 10K set: slices of the built-in names joined together, mostly short but up to 100 bytes, with about 15% longer than 16 bytes.
 
 ```sh
 ./create_measurements.sh 200000000 measurements-10k.txt 10000
