@@ -81,22 +81,27 @@ fn find_semicolon(buf: &[u8], start: usize) -> usize {
     }
 }
 
-/// Finds the ';' ending the station name at `start` and the name's first 16 bytes as zero-padded key words.
-/// Names of up to 16 bytes, nearly all of them, are found with a single 16-byte comparison
+/// Masks keeping the bytes up to and including byte `len` of a name's first 16, at `16 - len..32 - len`
+const NAME_MASKS: [u8; 33] = {
+    let mut masks = [0; 33];
+    let mut i = 0;
+    while i <= INLINE_KEY_LEN {
+        masks[i] = 0xFF;
+        i += 1;
+    }
+    masks
+};
+
+/// The station name at `start`: its length, capped at 16, and its key words. Names shorter than 16 bytes,
+/// nearly all of them, are found with a single 16-byte comparison, and their key words hold the ';' after them,
+/// which no longer name has within its first 16 bytes, so that the key alone tells short names apart
 fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
     let bytes = u8x16::from_slice(&buf[start..start + INLINE_KEY_LEN]);
-    // bit n is set if byte n is a ';', and bit 16 stands for one past the inline key
     let semicolons = bytes.simd_eq(u8x16::splat(b';')).to_bitmask() | 1 << INLINE_KEY_LEN;
     let len = semicolons.trailing_zeros() as usize;
-    let name_mask = u128::MAX >> (8 * (INLINE_KEY_LEN - len));
-    let name = u128::from_le_bytes(bytes.to_array()) & name_mask;
-    let key = [name as u64, (name >> 64) as u64];
-    let semicolon = if len < INLINE_KEY_LEN {
-        start + len
-    } else {
-        find_semicolon(buf, start + INLINE_KEY_LEN)
-    };
-    (semicolon, key)
+    let mask = u8x16::from_slice(&NAME_MASKS[INLINE_KEY_LEN - len..][..INLINE_KEY_LEN]);
+    let name = u128::from_le_bytes((bytes & mask).to_array());
+    (len, [name as u64, (name >> 64) as u64])
 }
 
 /// Branchless parse of a temperature (`-99.9`..`99.9`, one fractional digit) from the 8 bytes starting at it.
@@ -109,7 +114,8 @@ fn parse_temperature(word: u64) -> (i64, usize) {
     let sign = ((!word << 59) as i64) >> 63;
     let unsigned = word & !(sign as u64 & 0xFF);
     // align the '.' to byte 3, putting tens, ones and tenths digits to bytes 1, 2 and 4
-    let digits = (unsigned << (28 - dot_bit)) & 0x0F_000F_0F00;
+    // wrapping: lanes parse a temperature speculatively after a long name's first 16 bytes and discard it
+    let digits = unsigned.wrapping_shl(28u32.wrapping_sub(dot_bit)) & 0x0F_000F_0F00;
     // a single multiplication sums tens * 100 + ones * 10 + tenths into bits 32..42
     let abs = (digits.wrapping_mul(0x640a_0001) >> 32) & 0x3FF;
     let value = (abs as i64 ^ sign) - sign;
@@ -118,7 +124,12 @@ fn parse_temperature(word: u64) -> (i64, usize) {
 
 /// Parses the line starting at `start`, returning the station name, its key words, the measurement and the line length
 fn parse_line(buf: &[u8], start: usize) -> (&[u8], [u64; 2], i64, usize) {
-    let (semicolon, key) = parse_name(buf, start);
+    let (len, key) = parse_name(buf, start);
+    let semicolon = if len < INLINE_KEY_LEN {
+        start + len
+    } else {
+        find_semicolon(buf, start + INLINE_KEY_LEN)
+    };
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
     (
         &buf[start..semicolon],
@@ -275,8 +286,8 @@ impl StationTable {
 
     /// Records a measurement for `name`, whose first bytes are `key`
     fn record(&mut self, key: [u64; 2], name: &[u8], measurement: i64) {
-        let slot = if name.len() <= INLINE_KEY_LEN {
-            self.find_slot(key, name.len(), &[])
+        let slot = if name.len() < INLINE_KEY_LEN {
+            self.find_short_slot(key, name.len())
         } else {
             self.find_long_name_slot(key, name)
         };
@@ -288,6 +299,29 @@ impl StationTable {
     #[inline(never)]
     fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
         self.find_slot(key, name.len(), &name[INLINE_KEY_LEN..])
+    }
+
+    /// Finds the slot of the name shorter than the inline key with `key` and `len`, claiming an empty one for
+    /// a new name. The key alone tells such names apart, as it holds the ';' after the name
+    #[inline(always)]
+    fn find_short_slot(&mut self, key: [u64; 2], len: usize) -> &mut Slot {
+        let mut i = slot_index(key, &[]);
+        loop {
+            let slot = &self.slots[i];
+            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0 {
+                return &mut self.slots[i];
+            }
+            if slot.len == 0 {
+                self.slots[i] = Slot {
+                    key,
+                    len,
+                    tail_offset: 0,
+                    stats: WeatherStationStats::EMPTY,
+                };
+                return &mut self.slots[i];
+            }
+            i = (i + 1) % TABLE_SIZE;
+        }
     }
 
     /// Finds the slot of the name with `key`, `len` and `tail`, claiming an empty one for a new name
@@ -351,6 +385,13 @@ fn record_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
     start + line_len
 }
 
+/// `record_row` for a line whose name is at least 16 bytes long, kept out of the side-by-side loop
+#[cold]
+#[inline(never)]
+fn record_long_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
+    record_row(buf, stations, start)
+}
+
 /// Splits the lines starting before `until` into `K` parts, which start and end at line starts but the last,
 /// which ends at `until` and whose last line may run past it. `buf` must start at a line start, and `until / K`
 /// must exceed the longest valid line, so that each split point has a '\n' after it and before `until`
@@ -376,12 +417,19 @@ fn parse_lanes<const K: usize>(
 ) -> [usize; K] {
     while (0..K).all(|i| cursors[i] < ends[i]) {
         let names = cursors.map(|at| parse_name(buf, at));
-        let temperatures =
-            names.map(|(semicolon, _)| parse_temperature(load_u64(buf, semicolon + 1)));
+        let temperatures: [_; K] =
+            std::array::from_fn(|i| parse_temperature(load_u64(buf, cursors[i] + names[i].0 + 1)));
         for i in 0..K {
-            let (semicolon, key) = names[i];
-            stations.record(key, &buf[cursors[i]..semicolon], temperatures[i].0);
-            cursors[i] = semicolon + 1 + temperatures[i].1;
+            let (len, key) = names[i];
+            cursors[i] = if len < INLINE_KEY_LEN {
+                stations
+                    .find_short_slot(key, len)
+                    .stats
+                    .record(temperatures[i].0);
+                cursors[i] + len + 1 + temperatures[i].1
+            } else {
+                record_long_row(buf, stations, cursors[i])
+            };
         }
     }
     for i in 0..K {
@@ -532,6 +580,9 @@ mod tests {
             let line = [&name[..], b";-12.3\n"].concat();
             let mut inline = [0; 16];
             inline[..len.min(16)].copy_from_slice(&name[..len.min(16)]);
+            if len < 16 {
+                inline[len] = b';';
+            }
             let key = [
                 u64::from_le_bytes(inline[..8].try_into().unwrap()),
                 u64::from_le_bytes(inline[8..].try_into().unwrap()),
