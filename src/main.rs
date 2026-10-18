@@ -2,9 +2,9 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
-    ops::Add,
+    ops::{Add, Range},
     simd::{cmp::SimdPartialEq, u8x16},
     thread,
 };
@@ -135,10 +135,6 @@ fn parse_line(buf: &[u8], start: usize) -> (&[u8], [u64; 2], i64, usize) {
         semicolon + 1 + temperature_len - start,
     )
 }
-struct Chunk {
-    start_point: u64,
-    len: usize,
-}
 /// One thread is spawned per chunk, so this is both the chunk and the thread count.
 fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
     match brc_threads {
@@ -149,37 +145,37 @@ fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
         None => parallelism,
     }
 }
-fn chunk_le_file<T: BufRead + Seek>(mut f: T, file_len: usize) -> Vec<Chunk> {
-    let chunk_count = thread_count(
+/// Splits the file into at most `count` ranges of about equal size, each ending after a '\n' or at the file's end
+fn split_file(mut f: impl BufRead + Seek, file_len: u64, count: usize) -> Vec<Range<u64>> {
+    let chunk_size = file_len / count as u64 + 1;
+    let mut rest_of_line = Vec::with_capacity(MAX_LINE_LEN);
+    let mut ranges = Vec::with_capacity(count);
+    let mut start = 0;
+    while start < file_len {
+        let at = start + chunk_size;
+        let end = if at >= file_len {
+            file_len
+        } else {
+            f.seek(SeekFrom::Start(at)).unwrap();
+            rest_of_line.clear();
+            at + f.read_until(b'\n', &mut rest_of_line).unwrap() as u64
+        };
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+fn calc(file_name: Option<String>) -> String {
+    let file_name = file_name.unwrap_or("measurements.txt".into());
+    let f = File::open(&file_name).unwrap();
+    let file_len = f.metadata().unwrap().len();
+    let thread_count = thread_count(
         std::env::var("BRC_THREADS").ok(),
         std::thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1),
     );
-    let chunk_size = file_len / chunk_count + 1;
-    // max length of line is 100 bytes station name, ';', '-99.9', '\n'
-    let mut tmp_arr = Vec::with_capacity(107);
-    let mut res = vec![];
-    let mut cur_start = 0;
-    for _ in 0..chunk_count {
-        f.seek(std::io::SeekFrom::Current(chunk_size as i64))
-            .unwrap();
-        f.read_until(b'\n', &mut tmp_arr).unwrap();
-        let end_pos = f.stream_position().unwrap();
-        res.push(Chunk {
-            start_point: cur_start,
-            len: (end_pos - cur_start) as usize,
-        });
-        tmp_arr.clear();
-        cur_start = end_pos
-    }
-    res
-}
-fn calc(file_name: Option<String>) -> String {
-    let file_name = file_name.unwrap_or("measurements.txt".into());
-    let f = File::open(&file_name).unwrap();
-    let file_len = f.metadata().unwrap().len() as usize;
-    let chunks = chunk_le_file(BufReader::new(f), file_len);
+    let chunks = split_file(BufReader::new(f), file_len, thread_count);
     let stations = thread::scope(|s| {
         let handles = chunks
             .into_iter()
@@ -187,8 +183,8 @@ fn calc(file_name: Option<String>) -> String {
                 let file_name = &file_name;
                 s.spawn(move || {
                     let mut f = File::open(file_name).unwrap();
-                    f.seek(std::io::SeekFrom::Start(c.start_point)).unwrap();
-                    aggregate_measurements(f.take(c.len as u64))
+                    f.seek(SeekFrom::Start(c.start)).unwrap();
+                    aggregate_measurements(f.take(c.end - c.start))
                 })
             })
             .collect::<Vec<_>>();
@@ -498,6 +494,7 @@ mod tests {
     use crate::parse_temperature;
     use crate::record_row;
     use crate::slot_index;
+    use crate::split_file;
     use crate::split_lines;
     use crate::thread_count;
     use crate::StationTable;
@@ -703,6 +700,28 @@ mod tests {
             })
             .collect();
         assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
+    }
+
+    #[test]
+    fn split_file_splits_at_line_starts_into_at_most_count_ranges() {
+        let input: Vec<u8> = (0..50)
+            .flat_map(|i| format!("{}{i};{i}.0\n", "s".repeat(i % 7)).into_bytes())
+            .collect();
+        let len = input.len() as u64;
+        for count in [1, 2, 3, 8, 50, 1000] {
+            let ranges = split_file(std::io::Cursor::new(&input), len, count);
+            assert!(ranges.len() <= count, "{count}: {ranges:?}");
+            assert_eq!(ranges.first().map(|r| r.start), Some(0), "{count}");
+            assert_eq!(ranges.last().map(|r| r.end), Some(len), "{count}");
+            for range in &ranges {
+                assert!(!range.is_empty(), "{count}: {ranges:?}");
+                assert_eq!(input[range.end as usize - 1], b'\n', "{count}: {ranges:?}");
+            }
+            assert!(
+                ranges.windows(2).all(|w| w[0].end == w[1].start),
+                "{count}: {ranges:?}"
+            );
+        }
     }
 
     #[test]
