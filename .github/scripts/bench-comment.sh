@@ -9,6 +9,11 @@ shift 2
 
 echo "<!-- bench-compare -->"
 echo "### Benchmark against \`$base_ref\`"
+# results depend on the runner's hardware, which GitHub doesn't pin
+if [ -n "${RUNNER_CPU:-}" ]; then
+  echo
+  echo "Runner CPU: $RUNNER_CPU"
+fi
 while (($#)); do
   jq -r --arg dataset "$1" '
   def round_to($digits): (. * pow(10; $digits) | round) / pow(10; $digits);

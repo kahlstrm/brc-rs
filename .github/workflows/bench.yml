@@ -46,6 +46,10 @@ jobs:
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install hyperfine
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      - name: Identify the CPU
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          echo "RUNNER_CPU=$model, $(nproc) vCPUs, $(lscpu | sed -n 's/^Thread(s) per core: *//p') threads per core" >> "$GITHUB_ENV"
       - name: Benchmark
         # one dataset at a time, deleting each before the next: both don't fit in the runner's page cache,
         # and runs that read the file from disk measure the disk instead of the program
