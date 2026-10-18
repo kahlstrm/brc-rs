@@ -485,6 +485,8 @@ fn parse_lanes<const K: usize>(
     mut cursors: [usize; K],
     ends: [usize; K],
 ) -> [usize; K] {
+    // lets the compiler drop the bounds checks of the rows' loads
+    assert!(ends.iter().all(|&end| end + PADDING <= buf.len()));
     while (0..K).all(|i| cursors[i] < ends[i]) {
         let names = cursors.map(|at| parse_name(buf, at));
         let temperatures: [_; K] =
