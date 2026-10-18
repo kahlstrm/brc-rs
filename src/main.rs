@@ -333,7 +333,11 @@ impl StationTable {
     }
 }
 
-const CHUNK_SIZE: usize = 500_000;
+/// Bytes per `read`. Anything from 64 KiB to 1 MiB measures the same: smaller sizes pay for more system calls,
+/// and the hardware prefetcher hides cache misses on larger ones as the buffer is read front to back
+const CHUNK_SIZE: usize = 1 << 19;
+// The read buffer lives on its thread's stack, which `thread::spawn` makes 2 MiB
+const _: () = assert!(CHUNK_SIZE + PADDING <= 1 << 20);
 /// Longer than any valid line: 100 bytes of station name, ';', "-99.9" and '\n'
 const MAX_LINE_LEN: usize = 128;
 fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
