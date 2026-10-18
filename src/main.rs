@@ -109,12 +109,14 @@ fn parse_temperature(word: u64) -> (i64, usize) {
     let dot_bit = (!word & 0x1010_1000).trailing_zeros();
     // all ones if the first byte is '-', zero otherwise
     let sign = ((!word << 59) as i64) >> 63;
-    let unsigned = word & !(sign as u64 & 0xFF);
-    // align the '.' to byte 3, putting tens, ones and tenths digits to bytes 1, 2 and 4
-    // wrapping: lanes parse a temperature speculatively after a long name's first 16 bytes and discard it
-    let digits = unsigned.wrapping_shl(28u32.wrapping_sub(dot_bit)) & 0x0F_000F_0F00;
-    // a single multiplication sums tens * 100 + ones * 10 + tenths into bits 32..42
-    let abs = (digits.wrapping_mul(0x640a_0001) >> 32) & 0x3FF;
+    // clears the '-'
+    let unsigned = word ^ (sign as u64 & b'-' as u64);
+    // align the '.' to byte 2, putting tens, ones and tenths digits to bytes 0, 1 and 3: shifted right by the
+    // '.''s bit, which is 4 into its byte, after shifting left by 20 bits, which keeps the last digit's byte 4.
+    // Wrapping: lanes parse a temperature speculatively after a long name's first 16 bytes and discard it
+    let digits = (unsigned << 20).wrapping_shr(dot_bit) & 0x0F00_0F0F;
+    // a single multiplication sums tens * 100 + ones * 10 + tenths into bits 24..34
+    let abs = (digits.wrapping_mul(0x640a_0001) >> 24) & 0x3FF;
     let value = (abs as i64 ^ sign) - sign;
     (value, (dot_bit / 8) as usize + 3)
 }
