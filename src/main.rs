@@ -30,8 +30,15 @@ impl WeatherStationStats {
         count: 0,
     };
     fn record(&mut self, measurement: i64) {
-        self.min = self.min.min(measurement);
-        self.max = self.max.max(measurement);
+        // new extremes get rare after a station's first rows, so branches beat loading and storing both always
+        if measurement < self.min {
+            std::hint::cold_path();
+            self.min = measurement;
+        }
+        if measurement > self.max {
+            std::hint::cold_path();
+            self.max = measurement;
+        }
         self.sum += measurement;
         self.count += 1;
     }
