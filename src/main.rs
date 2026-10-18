@@ -391,6 +391,22 @@ fn parse_lanes<const K: usize>(
     }
     cursors
 }
+/// Records the lines of `buf` starting before `until`, which must start at a line start, returning where
+/// the first line at or after `until` starts. Lines are parsed in `LANES` parts side by side where they fit
+fn record_lines(buf: &[u8], stations: &mut StationTable, until: usize) -> usize {
+    // the precondition of `split_lines`
+    if until >= LANES * MAX_LINE_LEN {
+        let (starts, ends) = split_lines::<LANES>(buf, until);
+        parse_lanes(buf, stations, starts, ends)[LANES - 1]
+    } else {
+        let mut start = 0;
+        while start < until {
+            start = record_row(buf, stations, start);
+        }
+        start
+    }
+}
+
 fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
     let mut stations = StationTable::new();
     let mut buf = [0; CHUNK_SIZE + PADDING];
@@ -405,17 +421,7 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
         } else {
             filled.saturating_sub(MAX_LINE_LEN)
         };
-        // the precondition of `split_lines`
-        let consumed = if parse_until >= LANES * MAX_LINE_LEN {
-            let (starts, ends) = split_lines::<LANES>(&buf, parse_until);
-            parse_lanes(&buf, &mut stations, starts, ends)[LANES - 1]
-        } else {
-            let mut start = 0;
-            while start < parse_until {
-                start = record_row(&buf, &mut stations, start);
-            }
-            start
-        };
+        let consumed = record_lines(&buf, &mut stations, parse_until);
         if at_eof {
             break;
         }
