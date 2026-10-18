@@ -5,7 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
     ops::{Add, Range},
-    simd::{cmp::SimdPartialEq, u8x16},
+    simd::{cmp::SimdPartialEq, u64x2, u8x16, ToBytes},
     thread,
 };
 
@@ -57,25 +57,12 @@ impl Add<&mut Self> for WeatherStationStats {
         }
     }
 }
-/// Every load starts within the data, and the widest one, of a station name's first 16 bytes,
-/// can reach up to 15 bytes past it, so read buffers keep 16 bytes of padding after it
-const PADDING: usize = 2 * size_of::<u64>();
+/// Every load starts within the data, and the widest one, of a long station name's first 112 bytes,
+/// can reach up to 111 bytes past it, so read buffers keep 112 bytes of padding after it
+const PADDING: usize = INLINE_KEY_LEN + LONG_TAIL_LEN;
 
 fn load_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
-}
-
-/// Finds the first ';' at or after `start`, checking 16 bytes at a time
-fn find_semicolon(buf: &[u8], start: usize) -> usize {
-    let mut at = start;
-    loop {
-        let bytes = u8x16::from_slice(&buf[at..at + INLINE_KEY_LEN]);
-        let matches = bytes.simd_eq(u8x16::splat(b';')).to_bitmask();
-        if matches != 0 {
-            return at + matches.trailing_zeros() as usize;
-        }
-        at += INLINE_KEY_LEN;
-    }
 }
 
 /// Masks keeping the bytes up to and including byte `len` of a name's first 16, at `16 - len..32 - len`
@@ -99,6 +86,36 @@ fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
     let mask = u8x16::from_slice(&NAME_MASKS[INLINE_KEY_LEN - len..][..INLINE_KEY_LEN]);
     let name = u128::from_le_bytes((bytes & mask).to_array());
     (len, [name as u64, (name >> 64) as u64])
+}
+
+/// Bytes past the first 16 of a station name, which the challenge caps at 100 bytes, rounded up to 16
+const LONG_TAIL_LEN: usize = 6 * INLINE_KEY_LEN;
+/// The bytes of a long station name past its first 16, zero after the name
+type LongTail = [u8x16; LONG_TAIL_LEN / INLINE_KEY_LEN];
+
+/// Masks keeping the first `len` bytes of a long name's tail, at `LONG_TAIL_LEN - len..2 * LONG_TAIL_LEN - len`
+const TAIL_MASKS: [u8; 2 * LONG_TAIL_LEN] = {
+    let mut masks = [0; 2 * LONG_TAIL_LEN];
+    let mut i = 0;
+    while i < LONG_TAIL_LEN {
+        masks[i] = 0xFF;
+        i += 1;
+    }
+    masks
+};
+
+/// The length of the station name of at least 16 bytes at `start`, and its tail. The same work for any length
+/// up to 112 bytes, so that no branch depends on it, as such lengths are evenly spread
+fn parse_long_name(buf: &[u8], start: usize) -> (usize, LongTail) {
+    let bytes = &buf[start + INLINE_KEY_LEN..][..LONG_TAIL_LEN];
+    let chunks: LongTail = std::array::from_fn(|i| u8x16::from_slice(&bytes[i * INLINE_KEY_LEN..]));
+    let semicolons = chunks.iter().rev().fold(0, |bits: u128, chunk| {
+        bits << INLINE_KEY_LEN | chunk.simd_eq(u8x16::splat(b';')).to_bitmask() as u128
+    }) | 1 << LONG_TAIL_LEN;
+    let tail_len = semicolons.trailing_zeros() as usize;
+    let masks = &TAIL_MASKS[LONG_TAIL_LEN - tail_len..][..LONG_TAIL_LEN];
+    let tail = std::array::from_fn(|i| chunks[i] & u8x16::from_slice(&masks[i * INLINE_KEY_LEN..]));
+    (INLINE_KEY_LEN + tail_len, tail)
 }
 
 /// Branchless parse of a temperature (`-99.9`..`99.9`, one fractional digit) from the 8 bytes starting at it.
@@ -214,34 +231,24 @@ fn slot_index(key: [u64; 2]) -> usize {
     (hash >> (64 - TABLE_SIZE.trailing_zeros())) as usize
 }
 
-/// Slot of `name`, of at least 16 bytes, whose first 16 bytes are the key words `key`.
-/// The bytes past the key are folded in 8 at a time, ending with the last 8, so that every byte counts
-fn long_name_slot_index(key: [u64; 2], name: &[u8]) -> usize {
-    const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    let (words, _) = name[INLINE_KEY_LEN..].as_chunks::<8>();
-    let last = load_u64(name, name.len() - 8);
-    let rest = words
-        .iter()
-        .map(|word| u64::from_le_bytes(*word))
-        .chain([last])
-        .fold(name.len() as u64, |h, word| {
-            (h ^ word).wrapping_mul(K).rotate_left(29)
-        });
-    slot_index([key[0], key[1] ^ rest])
+/// Slot of the name of at least 16 bytes whose first 16 bytes are the key words `key`, with `tail` after them.
+/// Every 16 bytes of the tail are folded into the key, shifted by their own amount so that their order counts
+fn long_name_slot_index(key: [u64; 2], tail: &LongTail) -> usize {
+    let folded = tail.iter().fold(u64x2::splat(0), |folded, chunk| {
+        (folded << 1) ^ u64x2::from_ne_bytes(*chunk)
+    });
+    slot_index([key[0] ^ folded[0], key[1] ^ folded[1]])
 }
 
-/// Whether names of the same length of at least 16 bytes, whose first 16 bytes are known to match, are equal.
-/// Compared 16 bytes at a time, and by the last 16 bytes for the rest
-fn long_names_match(a: &[u8], b: &[u8]) -> bool {
-    let last = |name: &[u8]| u8x16::from_slice(&name[name.len() - INLINE_KEY_LEN..]);
-    let (a_chunks, _) = a[INLINE_KEY_LEN..].as_chunks::<INLINE_KEY_LEN>();
-    let (b_chunks, _) = b[INLINE_KEY_LEN..].as_chunks::<INLINE_KEY_LEN>();
-    let chunk = |bytes: &[u8; INLINE_KEY_LEN]| u8x16::from_array(*bytes);
-    a_chunks
+/// Whether `stored`, the tail of a name kept in `StationTable::long_names`, equals `tail`, compared at once
+fn long_tails_match(stored: &[u8], tail: &LongTail) -> bool {
+    let differing = tail
         .iter()
-        .zip(b_chunks)
-        .all(|(x, y)| chunk(x) == chunk(y))
-        && last(a) == last(b)
+        .zip(stored.as_chunks().0)
+        .fold(u8x16::splat(0), |differing, (chunk, stored)| {
+            differing | (chunk ^ u8x16::from_array(*stored))
+        });
+    differing == u8x16::splat(0)
 }
 
 /// One cache line per station, so a lookup and its update touch a single line
@@ -251,7 +258,7 @@ struct Slot {
     key: [u64; 2],
     /// Zero marks an empty slot, as station names are at least one byte long
     len: usize,
-    /// Where a name of at least 16 bytes starts in `StationTable::long_names`
+    /// Where a name of at least 16 bytes starts in `StationTable::long_names`, followed by zeros up to 112 bytes
     long_name_offset: usize,
     stats: WeatherStationStats,
 }
@@ -297,18 +304,17 @@ impl StationTable {
         }
     }
 
-    /// Finds the slot of `name`, of at least 16 bytes, whose first 16 bytes are `key`, claiming an empty one
-    /// for a new name. Hashed by all its bytes, see `long_name_slot_index`
+    /// Finds the slot of the name of `len` bytes, at least 16, whose first 16 bytes are `key`, with `tail` after
+    /// them, claiming an empty one for a new name. Hashed by all its bytes, see `long_name_slot_index`
     #[inline(always)]
-    fn find_long_name_slot(&mut self, key: [u64; 2], name: &[u8]) -> &mut Slot {
-        let mut i = long_name_slot_index(key, name);
+    fn find_long_name_slot(&mut self, key: [u64; 2], len: usize, tail: &LongTail) -> &mut Slot {
+        let mut i = long_name_slot_index(key, tail);
         loop {
             let slot = &self.slots[i];
-            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0
-                && slot.len == name.len()
-                && long_names_match(
-                    &self.long_names[slot.long_name_offset..][..name.len()],
-                    name,
+            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) | (slot.len ^ len) as u64 == 0
+                && long_tails_match(
+                    &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..][..LONG_TAIL_LEN],
+                    tail,
                 )
             {
                 return &mut self.slots[i];
@@ -316,11 +322,13 @@ impl StationTable {
             if slot.len == 0 {
                 self.slots[i] = Slot {
                     key,
-                    len: name.len(),
+                    len,
                     long_name_offset: self.long_names.len(),
                     stats: WeatherStationStats::EMPTY,
                 };
-                self.long_names.extend_from_slice(name);
+                let key_bytes = key.iter().flat_map(|word| word.to_le_bytes());
+                let tail_bytes = tail.iter().flat_map(|chunk| chunk.to_array());
+                self.long_names.extend(key_bytes.chain(tail_bytes));
                 return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
@@ -388,13 +396,13 @@ fn record_parsed_row(
 #[inline(never)]
 fn record_long_row(buf: &[u8], stations: &mut StationTable, start: usize) -> usize {
     let key = [load_u64(buf, start), load_u64(buf, start + 8)];
-    let semicolon = find_semicolon(buf, start + INLINE_KEY_LEN);
-    let (measurement, temperature_len) = parse_temperature(load_u64(buf, semicolon + 1));
+    let (len, tail) = parse_long_name(buf, start);
+    let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     stations
-        .find_long_name_slot(key, &buf[start..semicolon])
+        .find_long_name_slot(key, len, &tail)
         .stats
         .record(measurement);
-    semicolon + 1 + temperature_len
+    start + len + 1 + temperature_len
 }
 
 /// Splits the lines starting before `until` into `K` parts, which start and end at line starts but the last,
@@ -475,6 +483,7 @@ mod tests {
     use crate::calc;
     use crate::long_name_slot_index;
     use crate::parse_lanes;
+    use crate::parse_long_name;
     use crate::parse_name;
     use crate::parse_temperature;
     use crate::record_row;
@@ -695,7 +704,10 @@ mod tests {
     fn long_name_slot_index_spreads_names_alike_at_both_ends() {
         let names = (0..10_000).map(|i| format!("{}{i:05}{}", "P".repeat(16), "S".repeat(8)));
         let slots: std::collections::HashSet<_> = names
-            .map(|name| long_name_slot_index(key_of(name.as_bytes()), name.as_bytes()))
+            .map(|name| {
+                let buf = [name.as_bytes(), b";1.0\n", &[0; PADDING]].concat();
+                long_name_slot_index(key_of(name.as_bytes()), &parse_long_name(&buf, 0).1)
+            })
             .collect();
         assert!(slots.len() > 9_000, "{} distinct slots", slots.len());
     }
@@ -735,5 +747,37 @@ mod tests {
             calc(Some(path.to_str().unwrap().into())),
             format!("{{{prefix}=3.0/3.0/3.0, {prefix}A=1.0/3.0/5.0, {prefix}B=2.0/2.0/2.0, {long}=-6.0/-1.0/4.0}}\n")
         );
+    }
+
+    #[test]
+    fn long_names_of_every_length_differing_in_their_last_byte_get_a_slot_each() {
+        let names: Vec<Vec<u8>> = (16..=100)
+            .flat_map(|len| b"ab".map(|last| [b"n".repeat(len - 1), vec![last]].concat()))
+            .collect();
+        // each name twice, so that different bytes follow it, which must not count
+        let data: Vec<u8> = [&b"1.0"[..], b"-2.0"]
+            .iter()
+            .flat_map(|temperature| {
+                names
+                    .iter()
+                    .map(|name| [name, &b";"[..], temperature, b"\n"].concat())
+            })
+            .flatten()
+            .collect();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let mut stations = StationTable::new();
+        let mut start = 0;
+        while start < data.len() {
+            start = record_row(&buf, &mut stations, start);
+        }
+        let mut recorded: Vec<_> = stations
+            .into_stations()
+            .into_iter()
+            .map(|(name, stats)| (name, stats.min, stats.max, stats.count))
+            .collect();
+        recorded.sort();
+        let mut expected: Vec<_> = names.into_iter().map(|name| (name, -20, 10, 2)).collect();
+        expected.sort();
+        assert_eq!(recorded, expected);
     }
 }
