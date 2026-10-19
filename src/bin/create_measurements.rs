@@ -1,4 +1,4 @@
-use rand::prelude::*;
+use rand::{prelude::*, rng};
 use rand_distr::Normal;
 use std::collections::HashSet;
 use std::fs::File;
@@ -16,7 +16,7 @@ struct WeatherStation {
 impl WeatherStation {
     fn measurement(&self) -> f64 {
         let normal_dist = Normal::new(self.mean_temperature, 10.0).unwrap();
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let measurement = normal_dist.sample(&mut rng);
         (measurement * 10.0).round() / 10.0
     }
@@ -111,7 +111,7 @@ fn synthetic_names(count: usize) -> Vec<String> {
     let mut taken = HashSet::with_capacity(count);
     let mut names = Vec::with_capacity(count);
     while names.len() < count {
-        let len = (4.0 + 2500.0 * (rng.gen::<f64>() - 0.372).powi(7)).max(1.0) as usize;
+        let len = (4.0 + 2500.0 * (rng.random::<f64>() - 0.372).powi(7)).max(1.0) as usize;
         let mut name: Vec<char> = source.by_ref().take(len).collect();
         let last = name.len() - 1;
         for end in [0, last] {
@@ -133,7 +133,7 @@ fn synthetic_names(count: usize) -> Vec<String> {
             let c = source.find(|c| !c.is_whitespace()).unwrap();
             match name.len() {
                 ..3 => name.push(c),
-                len => name[rng.gen_range(0..len)] = c,
+                len => name[rng.random_range(0..len)] = c,
             }
         }
         names.push(name.iter().collect());
@@ -152,7 +152,7 @@ fn create_measurements<W: Write + Send>(
     let mut tmp_line = Vec::with_capacity(106);
 
     for _ in 0..count {
-        let (name, station) = &stations[thread_rng().gen_range(0..stations.len())];
+        let (name, station) = &stations[rng().random_range(0..stations.len())];
 
         writeln!(tmp_line, "{};{:.1}", name, station.measurement())?;
         if tmp_line.len() + tmp_res.len() > TMP_VEC_CAPACITY {
