@@ -428,6 +428,242 @@ More optimizations could be done, for instance making line parsing branchless, u
 For now, I'm quite happy with the results, and I'll leave it at that (for now?)
 
 
+## Part 2: Revisiting it in 2026
+
+The conclusion above ended with "I'll leave it at that (for now?)". It turns out the question mark was warranted.
+
+In October 2026 I picked the project up again, this time pairing with coding agents: I set the direction and the rules, reviewed and merged every pull request, and the agents did most of the profiling, benchmarking and typing.
+The rules stayed the same: safe Rust, no dependencies, standard library only.
+I made a single concession along the way, the nightly-only [`std::simd`](https://doc.rust-lang.org/std/simd/index.html), which is still safe code and still part of the standard library.
+
+The M1 Max from Part 1 was not available, so everything below is measured on a Linux VM with 8 cores of an AMD Ryzen 9 5950X.
+On it, the version Part 1 ended with processes the billion rows in 3.3 seconds.
+
+The other change is a second dataset. The original challenge also had a [10K variant](https://github.com/gunnarmorling/1brc#rules-and-limits) with 10,000 station names of up to 100 bytes, instead of the 413 mostly short ones in the default file.
+Its 10,000 table slots, 640 KB, no longer fit in a core's L2 cache, and around 15% of its names are longer than 16 bytes, which makes it a good way to catch optimizations that only work on short names.
+Every change from here on was measured on both: the default 1 billion rows, and 200 million rows over 10,000 stations.
+
+Many of the tricks below come from the Java entries of the original challenge.
+If you'd rather watch than read, Roy van Rijn's GOTO 2024 talk [Java, How Fast Can You Parse 1 Billion Rows of Weather Data?](https://www.youtube.com/watch?v=EFXxXFHpS0M) is a good tour of how those entries got so fast.
+
+| Optimization | 1B rows (mean ± σ) | 10K stations (mean ± σ) | Summary |
+| --- | --- | --- | --- |
+| [End of Part 1](#part-2-revisiting-it-in-2026) | 3.300 s ± 0.022 | 1.211 s ± 0.016 | Part 1's final version, re-measured on the new machine |
+| [One thread per core](#measuring-before-optimizing) | 3.196 s ± 0.014 <strong style="color:lime;">(-3%)</strong> | 0.934 s ± 0.024 <strong style="color:lime;">(-23%)</strong> | Stop oversubscribing threads, as reads from the page cache don't block |
+| [Branchless temperature parsing](#branchless-temperature-parsing) | 2.973 s ± 0.044 <strong style="color:lime;">(-7%)</strong> | 0.906 s ± 0.008 <strong style="color:lime;">(-3%)</strong> | Parse the temperature from a single 8-byte load without branches |
+| [SWAR semicolon search](#finding-the-semicolon-8-bytes-at-a-time) | 2.546 s ± 0.084 <strong style="color:lime;">(-14%)</strong> | 0.699 s ± 0.006 <strong style="color:lime;">(-23%)</strong> | Find the ';' 8 bytes at a time |
+| [A custom station table](#a-hash-table-of-our-own) | 1.494 s ± 0.006 <strong style="color:lime;">(-41%)</strong> | 0.558 s ± 0.009 <strong style="color:lime;">(-20%)</strong> | Replace `HashMap` with an open-addressing table keyed by the name's first 16 bytes |
+| [Reuse the loaded words](#a-hash-table-of-our-own) | 1.263 s ± 0.008 <strong style="color:lime;">(-15%)</strong> | 0.559 s ± 0.003 (0%) | Use the same two words for the ';' search and the key |
+| [Shorter per-row path](#a-hash-table-of-our-own) | 1.215 s ± 0.032 <strong style="color:lime;">(-4%)</strong> | 0.546 s ± 0.020 <strong style="color:lime;">(-2%)</strong> | Move long names to a cold path, compare the key word by word |
+| [`std::simd`](#reaching-for-stdsimd) | 1.131 s ± 0.005 <strong style="color:lime;">(-7%)</strong> | 0.506 s ± 0.006 <strong style="color:lime;">(-7%)</strong> | Find the ';' in the first 16 bytes with one vector comparison |
+| [Hash long names 8 bytes at a time](#long-station-names) | 1.101 s ± 0.011 <strong style="color:lime;">(-3%)</strong> | 0.443 s ± 0.013 <strong style="color:lime;">(-12%)</strong> | Shorten the chain of multiplications in long names' hashes |
+| [Two lanes](#parsing-in-lanes) | 0.932 s ± 0.027 <strong style="color:lime;">(-15%)</strong> | 0.436 s ± 0.006 <strong style="color:lime;">(-2%)</strong> | Parse two parts of each buffer side by side |
+| [Keep the ';' in the key](#reaching-for-stdsimd) | 0.901 s ± 0.010 <strong style="color:lime;">(-3%)</strong> | 0.421 s ± 0.008 <strong style="color:lime;">(-3%)</strong> | Tell short names apart by their key alone |
+| [Min and max only when they change](#min-and-max-only-when-they-change) | 0.844 s ± 0.005 <strong style="color:lime;">(-6%)</strong> | 0.413 s ± 0.020 <strong style="color:lime;">(-2%)</strong> | Branch instead of storing both on every row |
+| [Store long names whole](#long-station-names) | 0.832 s ± 0.006 <strong style="color:lime;">(-1%)</strong> | 0.352 s ± 0.021 <strong style="color:lime;">(-15%)</strong> | Handle long names' rows entirely on their own path |
+| [Fewer live values, no bounds checks](#parsing-in-lanes) | 0.780 s ± 0.011 <strong style="color:lime;">(-6%)</strong> | 0.328 s ± 0.002 <strong style="color:lime;">(-7%)</strong> | Parse temperatures later, pad by a line and assert once per buffer |
+| [Three lanes](#parsing-in-lanes) | 0.738 s ± 0.012 <strong style="color:lime;">(-5%)</strong> | 0.328 s ± 0.002 (0%) | Three parts side by side, now that they fit in registers |
+| [Long names with fixed work](#long-station-names) | 0.736 s ± 0.015 (0%) | 0.329 s ± 0.015 (0%) | The same work for long names of any length |
+| [`target-cpu=native`](#building-for-the-machine-at-hand) | 0.688 s ± 0.006 <strong style="color:lime;">(-7%)</strong> | 0.305 s ± 0.005 <strong style="color:lime;">(-7%)</strong> | Build for the CPU of the machine running it |
+
+Infrastructure and refactoring changes without an effect on the run time are left out, and the times are measured with `hyperfine`, 5 runs each, with both files in the page cache.
+
+### Measuring before optimizing
+
+Before touching the hot path, the project needed a way to tell a 2% win from noise.
+
+A [Nix](https://nixos.org/) flake now provides the toolchain, hyperfine, samply and perf with `nix develop`.
+More importantly, every pull request is now benchmarked in CI against its base branch: both are built, run on both datasets in the same hyperfine session, their outputs are compared byte for byte, and the result is posted as a comment on the pull request.
+
+The first datasets for the 10K case just suffixed the 413 names with `#1`, `#2` and so on, which kept them short.
+The challenge's own 10K set is generated by slicing the built-in names together, so the generator now does the same: on average 11 bytes, but with about 1,550 names over 16 bytes, practically the same as the official set.
+That change alone shifted where the time went, as we'll see.
+
+One quick win came from the threads: Part 1 spawned four times as many chunks as cores to hide I/O blocking.
+With the file in the page cache `read()` never blocks, so the extra threads only added context switches. One thread per core was 3% faster on the default dataset, and 23% on the 10K one.
+
+### Branchless temperature parsing
+
+The custom measurement parser from Part 1 walked the bytes one at a time, with a branch for the sign and one for the number of digits.
+The fastest Java solutions use a trick by [merykitty](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_merykittyunsafe.java) that parses the whole temperature from a single 8-byte load, without any branches:
+
+```rust
+fn parse_temperature(word: u64) -> (i64, usize) {
+    // ASCII digits have bit 4 set while '.' and '-' do not: locate the '.', which is at byte 1, 2 or 3
+    let dot_bit = (!word & 0x1010_1000).trailing_zeros();
+    // all ones if the first byte is '-', zero otherwise
+    let sign = ((!word << 59) as i64) >> 63;
+    // clears the '-'
+    let unsigned = word ^ (sign as u64 & b'-' as u64);
+    // align the '.' to byte 2, putting tens, ones and tenths digits to bytes 0, 1 and 3
+    let digits = (unsigned << 20).wrapping_shr(dot_bit) & 0x0F00_0F0F;
+    // a single multiplication sums tens * 100 + ones * 10 + tenths into bits 24..34
+    let abs = (digits.wrapping_mul(0x640a_0001) >> 24) & 0x3FF;
+    let value = (abs as i64 ^ sign) - sign;
+    (value, (dot_bit / 8) as usize + 3)
+}
+```
+
+The multiplication is the neat part: with the digits in bytes 0, 1 and 3, multiplying by `0x640a_0001` adds `100 * tens`, `10 * ones` and `tenths` together into bits 24 to 34, in one instruction.
+Since the position of the '.' tells the length of the temperature, the function also returns where the next line starts, so we no longer search for the newline either.
+
+To load 8 bytes from the last line of a buffer, the read buffer gets a bit of padding after the data.
+A test runs every value from -99.9 to 99.9 through it.
+
+### Finding the semicolon 8 bytes at a time
+
+The separator was found by reading the line backwards from its end, which first requires finding the end.
+Instead, we can search for the ';' forwards, 8 bytes at a time, with the classic [SWAR](https://en.wikipedia.org/wiki/SWAR) zero-byte test: xor the word with eight ';' bytes, and the bytes that were ';' are now zero, which `(x - 0x0101..01) & !x & 0x8080..80` finds.
+The lowest set bit, divided by 8, is the length of the name.
+
+Together these two cut a fifth of the run time on the default dataset, and a quarter on the 10K one. And with parsing that cheap, the profile now had a clear new target: 70% of the time was spent in the `HashMap`.
+
+### A hash table of our own
+
+The standard `HashMap` is general-purpose: it hashes the key, probes its control bytes, and then compares the key, which lives in a separately allocated `Vec<u8>` on the heap.
+We know far more about our keys than that.
+
+The replacement is an open-addressing table of 65,536 slots, one 64-byte cache line each, with linear probing.
+Each slot stores the first 16 bytes of the station name inline, as two `u64`s, next to the station's statistics.
+As the 8-byte words of the name are already loaded for the semicolon search, the same words, masked to the name's length, are the key: a lookup is a multiplication for the hash, and a comparison of two integers.
+
+The table alone cut 41% of the run time. Two follow-ups shortened the path further: reusing the loaded words for both the search and the key instead of loading them twice, and moving everything to do with names longer than 16 bytes out of the hot path into a `#[cold]` function.
+
+One detail from the latter: comparing the key as a `[u64; 2]` compiled to a single 16-byte load of a key that had just been stored as two 8-byte words, and the CPU cannot forward two stores into one wider load, so it stalled. Comparing the words one by one was faster.
+
+### Reaching for `std::simd`
+
+At this point, all the stable tricks for the hot path had been used.
+Instead of two 8-byte SWAR searches, `std::simd` lets us compare all of the first 16 bytes to ';' with a single instruction:
+
+```rust
+fn parse_name(buf: &[u8], start: usize) -> (usize, [u64; 2]) {
+    let bytes = u8x16::from_slice(&buf[start..start + INLINE_KEY_LEN]);
+    let semicolons = bytes.simd_eq(u8x16::splat(b';')).to_bitmask() | 1 << INLINE_KEY_LEN;
+    let len = semicolons.trailing_zeros() as usize;
+    let mask = u8x16::from_slice(&NAME_MASKS[INLINE_KEY_LEN - len..][..INLINE_KEY_LEN]);
+    let name = u128::from_le_bytes((bytes & mask).to_array());
+    (len, [name as u64, (name >> 64) as u64])
+}
+```
+
+`std::simd` is portable: the same code compiles to SSE or AVX on x86 and NEON on ARM.
+It needs a nightly compiler, so the toolchain is pinned in `rust-toolchain.toml`. 20% fewer instructions per row was worth it.
+
+The mask also keeps the ';' itself in the key for names shorter than 16 bytes.
+That sounds odd, but it means two different short names always have different keys, so a lookup no longer needs to compare the lengths at all.
+
+### Long station names
+
+On the default dataset, names of 16 bytes or more are rare. On the 10K dataset, 16% of the rows have one, and those rows took about half of the time.
+
+The first problem was the hash: the bytes past the first 16 were hashed one at a time, each step a multiplication waiting for the previous one. Hashing 8 bytes per step made the 10K dataset 12% faster.
+
+The rest took several rounds. Long names are now stored whole and handled entirely on their own, cold path: a single fixed amount of work for any length, as their lengths are spread evenly and every branch on the length mispredicted.
+The name is loaded as six 16-byte chunks, the ';' is found from all of them at once, and the bytes past it are masked to zero:
+
+```rust
+fn parse_long_name<const N: usize>(buf: &[u8], start: usize) -> (usize, LongTail<N>) {
+    let bytes = &buf[start + INLINE_KEY_LEN..][..N * INLINE_KEY_LEN];
+    let chunks: LongTail<N> =
+        std::array::from_fn(|i| u8x16::from_slice(&bytes[i * INLINE_KEY_LEN..]));
+    let semicolons = chunks.iter().rev().fold(0, |bits: u128, chunk| {
+        bits << INLINE_KEY_LEN | chunk.simd_eq(u8x16::splat(b';')).to_bitmask() as u128
+    }) | 1 << (N * INLINE_KEY_LEN);
+    let tail_len = semicolons.trailing_zeros() as usize;
+    let masks = tail_masks::<N>(tail_len);
+    (
+        INLINE_KEY_LEN + tail_len,
+        std::array::from_fn(|i| chunks[i] & masks[i]),
+    )
+}
+```
+
+In wall time this barely registered, but a single thread on the 10K dataset now needs 5% fewer cycles per row, with a third fewer branch mispredictions.
+
+Names shorter than 32 bytes, which covers all the long names of the default dataset, take the same path with a single chunk.
+The chunks are hashed by multiplying the 32-bit halves of each 64-bit word with each other after xoring in a key, an [NH-style](https://en.wikipedia.org/wiki/UMAC_(cryptography)#NH_and_RFC_4418) hash, where all the multiplications are independent of each other.
+
+The hash had a lesson of its own: a simpler xor-and-shift fold was slightly faster, until a test generated 10,000 names that differ in pairs of bits 16 bytes apart. They all landed in the same slot, and the run took 72 times longer. Even when the input is not malicious, a hash should not have such an easy pathological case.
+
+### Min and max only when they change
+
+A small one: after a station's first few rows, a new minimum or maximum is rare.
+Instead of always computing `min` and `max` and storing both, an `if` around each lets the branch predictor skip the stores almost every time, which was 2–6% faster.
+
+### Parsing in lanes
+
+Each row goes through a chain of dependent steps: find the ';', hash the name, load the slot, compare the key, update the statistics.
+Within a row, each step waits for the previous one, while the CPU could do much more at once.
+
+The top Java solutions work around this by parsing several independent parts of the input side by side, and so does this one now.
+Each read buffer is split into line-aligned lanes, and a loop advances a cursor in each of them in turn:
+
+```rust
+while (0..K).all(|i| cursors[i] < ends[i]) {
+    let names = cursors.map(|at| parse_name(buf, at));
+    for i in 0..K {
+        cursors[i] = record_named_row(buf, stations, cursors[i], names[i]);
+    }
+}
+```
+
+Two lanes made the default dataset 15% faster, even with 7% more instructions. Three lanes, however, were no faster than two: they had more values to keep at once than there are registers, and the compiler spilled them to the stack.
+
+Getting three lanes to pay off took two preparatory changes:
+
+1. Parse each row's temperature only when its row is recorded, instead of together with the names, so fewer values are alive at once.
+2. Pad the read buffer by a full line, 128 bytes, instead of 16, and `assert!` once before the loop that every lane ends at least that far from the end of the buffer. From that, the compiler can prove that no load of any row is out of bounds, and drops the bounds checks of every row: about 5 instructions less per row, in safe Rust.
+
+The same `assert!` without the first change was 12% *slower*, and three lanes without both were slower than two. With both, three lanes overlap the rows' steps enough to be worth their extra instructions.
+
+### Building for the machine at hand
+
+The last change is a single line in `.cargo/config.toml`:
+
+```toml
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
+Challenge entries are built and run on the same machine, so the compiler may use every instruction the CPU has. With BMI2 and AVX, it needs 12–13% fewer instructions, and the run time dropped 7% on both datasets.
+
+### What didn't work
+
+Not everything made it in.
+
+- **Memory-mapping the file, and the Java "worker-exit" trick.** The fastest Java solutions `mmap` the file and do the work in a child process, so that unmapping 13 GB happens after the timer stops. Copying that behind an opt-in `unsafe` feature showed that most of what it hides depends on the state of the page cache: with a freshly written file unmapping takes 0.15 s, but with the file read back from disk there's nothing to hide. The default build stays with `read()`.
+- **Padding long names to a fixed size** so that comparing them needs no masking. Fewer instructions, but the padded names of the 10K dataset took 179 KB instead of 75 KB, L2 misses per row rose 15%, and one of the CI runners measured it 6% slower. Long names are stored packed.
+- **Wider vectors for long names.** With AVX2, a long name could be handled in three 32-byte chunks instead of six 16-byte ones. That was 3.5% faster on the 10K dataset, but 2% slower on the default one, where every long name fits in 32 bytes and the wider chunks only lengthen the chain of dependent steps. A version mixing both widths gained only 1%, not worth the complexity.
+- **Four lanes**, which do not fit in the registers, and **a bigger or smaller table**: 32,768 slots were 6–8% slower on the 10K dataset, and 131,072 gained nothing.
+
+Benchmarking in CI had its own lesson: the runners are picked at random from several AMD and Intel CPUs, all sharing their cores between two threads. Three lanes were 4% faster on my machine, but 2.3% slower in CI until the register spills were fixed. A change that saves cycles on one CPU but adds instructions or memory can lose on another.
+
+### How does it compare?
+
+On the same machine, with the file in the page cache, against native-image builds of the top three Java entries of the original challenge:
+
+| Solution | 1B rows | 10K stations |
+| --- | --- | --- |
+| brc-rs | 0.69 s | 0.30 s |
+| [thomaswue](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_thomaswue.java) | 0.77 s | 0.63 s |
+| [jerrinot](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_jerrinot.java) | 0.81 s | 0.47 s |
+| [artsiomkorzun](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_artsiomkorzun.java) | 0.83 s | 0.49 s |
+
+Not bad for safe Rust without dependencies. The comparison is not quite the original challenge's, though: there the file sat on a RAM disk, where the `mmap` solutions and their worker-exit trick have more to gain, as described above.
+
+## Conclusion, Part 2
+
+The program now processes the billion rows in 0.69 seconds on the 5950X: 4.8× faster than where Part 1 ended on the same machine, and around 130× faster than the very first version, which takes 89 seconds on it.
+The 10K dataset went from 1.21 seconds to 0.31, 4.0× faster.
+
+Unlike in Part 1, the biggest win was not one change: it was a long series of small ones, each measured on two datasets and on whatever CPU the CI runner happened to have.
+Several of them only paid off together: three lanes needed fewer live values and the bounds checks gone first.
+
+The things Part 1 left for later, branchless parsing and memory-mapped files, went one each way: the parsing has no branches left, and `mmap` turned out not to be needed.
+What's left is mostly the long names of the 10K dataset, which still take about half of its time on a sixth of its rows.
+
+
 ## Development
 
 ### Prerequisites
