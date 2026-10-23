@@ -664,6 +664,29 @@ The things Part 1 left for later, branchless parsing and memory-mapped files, we
 What's left is mostly the long names of the 10K dataset, which still take about half of its time on a sixth of its rows.
 
 
+## Part 3: A port to Mojo
+
+How close does [Mojo](https://mojolang.org/) get with the same rules? `mojo/` holds a port of the program above to Mojo 1.2: the same algorithm, Mojo's standard library only, and safe code only, so no `UnsafePointer`, none of the standard library's `unsafe_` functions and no calls into C. Indexing stays bounds-checked, as Mojo does by default on CPUs.
+
+On the same machine, with both files in the page cache, the median of 15 runs of each, alternating between the two:
+
+| Solution | 1B rows | 10K stations |
+| --- | --- | --- |
+| brc-rs | 0.664 s | 0.312 s |
+| Mojo port | 0.651 s | 0.309 s |
+
+Most of the Rust version carries over: the 16-byte keys with the ';' in them, the branchless temperature parsing, packed long names, parsing in lanes. What differs:
+
+- **Processes instead of threads.** Mojo's standard library has no threads: its thread pool is only reachable through async tasks, which the compiler itself calls experimental, and `parallelize` moved to the MAX library. So the program starts copies of itself with `std.os.Process`, which send their stations back through pipes. They take their work from a pipe too: it holds the bounds of the file's chunks, 16 bytes each, and as reads of a pipe never interleave, each read takes one chunk whole. Each chunk is a quarter of what is left per process, so that the chunks shrink towards the end and every process finishes within a millisecond of the others, which also hides that workers start several milliseconds late. Every Mojo process spends about 8 ms setting up its runtime before `main`, which is where most of the remaining difference on these files comes from.
+- **Bounds checks.** A failed slice check in Mojo's standard library may return, and it gets the slice's bounds by reference, so after one, LLVM no longer knows anything about them and keeps every later check. Checking first with a helper that calls `abort()`, which doesn't return, lets it drop both. Mojo's `Int` arithmetic may wrap, so LLVM can't prove `cursor + 128` in bounds from `cursor < end` either; lanes instead stop at unsigned bounds clamped to the buffer's length, a constant, from which its range analysis proves every row's loads in bounds.
+- **Masks in the read buffer.** The masks that cut a name off at its ';' are kept right after the read buffer's data, so that loading them needs no register of their own. A `comptime` table would be copied to the stack each time it's used.
+- **Half a cache line per station.** Slots are 32 bytes, with 16-bit minimums and maximums and a 32-bit count: the 10K stations' slots take half as many cache lines. A long name's slot keeps its length and where it is stored in place of its second 8 bytes, tagged with a 0xFF byte, which UTF-8 never has, so that no short name's key can match it.
+- **Branch hints.** `likely` and `unlikely` from `std.sys.intrinsics` mark the rare paths, as `cold_path()` and `#[cold]` do in the Rust version. With them, LLVM keeps the spills of the calls on those paths out of the hot loop, and four lanes become faster than three.
+
+The Mojo standard library had two surprises on the way: `Process.run` passes a garbled copy of any argument built at run time that is short enough to be stored inside its `String`, so workers get their job through an environment variable instead, and a `Pipe` is closed as soon as it is last used, which happened to be before the workers had read from it.
+
+What didn't work: parsing a batch of rows first and looking their stations up after, a table of their own for long names, smaller tables, inlining the long names' path, and more processes than cores.
+
 ## Development
 
 ### Prerequisites
@@ -693,6 +716,26 @@ cargo test
 ```
 
 This tests the example files inside `samples`-directory
+
+### The Mojo port
+
+`nix develop .#mojo` installs the Mojo version pinned in `mojo/requirements.txt` into `mojo/.venv`. Without Nix, `pip install --requirement mojo/requirements.txt` installs it into the active Python environment.
+From the repository root:
+
+```sh
+mojo build -I mojo -o target/mojo/brc mojo/main.mojo
+target/mojo/brc measurements.txt
+```
+
+Like `mojo build` by default, it builds for the CPU of the machine building it. `BRC_THREADS` sets the number of processes, one per core by default.
+To run the tests, which compare the output for every file in `samples` too:
+
+```sh
+mojo build -I mojo -o target/mojo/test_brc mojo/test_brc.mojo
+target/mojo/test_brc
+```
+
+`mojo/bench.sh <filename>` builds both versions and compares them with hyperfine.
 
 ### Generating measurements
 
