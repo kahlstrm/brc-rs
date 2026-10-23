@@ -37,8 +37,7 @@ jobs:
           echo "CPU_MODEL=$(printf '%s' "$model" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ubuntu-latest
-          key: ${{ env.CPU_MODEL }}
+          shared-key: ubuntu-latest-${{ env.CPU_MODEL }}
       - name: Build PR and base
         run: |
           cargo build --release

@@ -39,8 +39,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true
-          shared-key: ${{ matrix.os }}
-          key: ${{ env.CPU_MODEL }}
+          shared-key: ${{ matrix.os }}-${{ env.CPU_MODEL }}
       - run: cargo build --verbose
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --verbose --all-features
