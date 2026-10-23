@@ -29,9 +29,15 @@ jobs:
           fetch-depth: 0
       # the PR builds with its rust-toolchain.toml, and a base without one builds with stable
       - run: rustup update stable && rustup default stable && rustup toolchain install
+      # builds are for the CPU of the runner, so a cache built on another CPU may hold binaries this one can't run
+      - name: Identify the CPU for the build cache
+        run: |
+          model=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p')
+          [ -n "$model" ] || model=$(sysctl -n machdep.cpu.brand_string)
+          echo "CPU_MODEL=$(printf '%s' "$model" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ubuntu-latest
+          shared-key: ubuntu-latest-${{ env.CPU_MODEL }}
       - name: Build PR and base
         run: |
           cargo build --release
