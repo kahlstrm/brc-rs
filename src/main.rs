@@ -1,10 +1,9 @@
 #![feature(portable_simd)]
 use std::{
-    collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
-    ops::{Add, Range},
+    ops::{AddAssign, Range},
     simd::{cmp::SimdPartialEq, u64x2, u8x16, ToBytes},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -46,11 +45,9 @@ impl WeatherStationStats {
         self.sum as f64 / 10.0 / self.count as f64
     }
 }
-impl Add<&mut Self> for WeatherStationStats {
-    type Output = Self;
-
-    fn add(self, rhs: &mut Self) -> Self::Output {
-        WeatherStationStats {
+impl AddAssign for WeatherStationStats {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = WeatherStationStats {
             min: self.min.min(rhs.min),
             max: self.max.max(rhs.max),
             sum: self.sum + rhs.sum,
@@ -236,37 +233,80 @@ fn calc(file_name: Option<String>) -> String {
                             (&f).take(lines.end - lines.start),
                         );
                     }
-                    stations.into_stations()
+                    stations
                 })
             })
             .collect::<Vec<_>>();
-        let mut stations = BTreeMap::new();
-        for h in handles {
-            let stations_välipala = h.join().unwrap();
-            for (k, v) in stations_välipala {
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .reduce(|mut stations, stations_välipala| {
+                stations.merge(&stations_välipala);
                 stations
-                    .entry(k)
-                    .and_modify(|jutska| *jutska = v + jutska)
-                    .or_insert(v);
-            }
-        }
-        stations
-    });
-    String::from("{")
-        + &stations
-            .iter()
-            .map(|(station, stats)| {
-                format!(
-                    "{}={:.1}/{:.1}/{:.1}",
-                    String::from_utf8_lossy(station),
-                    stats.min as f64 / 10.0,
-                    stats.mean(),
-                    stats.max as f64 / 10.0
-                )
             })
-            .collect::<Vec<_>>()
-            .join(", ")
-        + &String::from("}\n")
+            .unwrap_or_else(StationTable::new)
+    });
+    let mut output = vec![b'{'];
+    for (i, station) in stations.sorted_stations().iter().enumerate() {
+        if i > 0 {
+            output.extend_from_slice(b", ");
+        }
+        station.write_name(&mut output);
+        output.push(b'=');
+        write_tenths(
+            &mut output,
+            station.stats.min < 0,
+            station.stats.min.unsigned_abs(),
+        );
+        output.push(b'/');
+        let (negative, mean) = round_to_tenths(station.stats.mean());
+        write_tenths(&mut output, negative, mean);
+        output.push(b'/');
+        write_tenths(
+            &mut output,
+            station.stats.max < 0,
+            station.stats.max.unsigned_abs(),
+        );
+    }
+    output.extend_from_slice(b"}\n");
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Writes `tenths` as a decimal with one fractional digit, as `{:.1}` writes the number it is the tenths of
+fn write_tenths(output: &mut Vec<u8>, negative: bool, tenths: u64) {
+    if negative {
+        output.push(b'-');
+    }
+    let whole = tenths / 10;
+    let digits = whole.checked_ilog10().unwrap_or(0) + 1;
+    output.extend(
+        (0..digits)
+            .rev()
+            .map(|i| b'0' + (whole / 10u64.pow(i) % 10) as u8),
+    );
+    output.extend_from_slice(&[b'.', b'0' + (tenths % 10) as u8]);
+}
+
+/// Whether `value` is negative and its magnitude in tenths, rounded as `{:.1}` rounds it: its exact binary value
+/// to the nearest tenth, ties to even. Exact rather than through `value * 10.0`, whose own rounding may tip it over
+/// a half. `value` must be below 2^52 in magnitude, which a mean of temperatures always is
+fn round_to_tenths(value: f64) -> (bool, u64) {
+    let bits = value.to_bits();
+    let biased_exponent = (bits >> 52 & 0x7FF) as i64;
+    let mantissa = bits & ((1 << 52) - 1) | ((biased_exponent != 0) as u64) << 52;
+    // value = mantissa * 2^-shift; past 64, ten times the mantissa, below 2^57, is under half of 2^-shift
+    let shift = 1075 - biased_exponent.max(1);
+    assert!(shift > 0, "{value} is not below 2^52 in magnitude");
+    let shift = shift.min(64) as u32;
+    let scaled = 10 * mantissa as u128;
+    let truncated = scaled >> shift;
+    let remainder = scaled - (truncated << shift);
+    let half = 1 << (shift - 1);
+    let rounds_up = remainder > half || remainder == half && truncated & 1 == 1;
+    (
+        value.is_sign_negative(),
+        (truncated + rounds_up as u128) as u64,
+    )
 }
 
 /// Bytes of a station name stored inline in its slot and compared as two words
@@ -429,23 +469,77 @@ impl StationTable {
         }
     }
 
-    fn into_stations(self) -> Vec<(Vec<u8>, WeatherStationStats)> {
-        self.slots
-            .iter()
-            .filter(|slot| slot.len != 0)
+    fn occupied_slots(&self) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().filter(|slot| slot.len != 0)
+    }
+
+    /// The tail of the long name in `slot` as `parse_long_name::<N>` returns it, zero past the name
+    fn stored_tail<const N: usize>(&self, slot: &Slot) -> LongTail<N> {
+        let stored = &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..];
+        let masks = tail_masks::<N>(slot.len - INLINE_KEY_LEN);
+        std::array::from_fn(|i| u8x16::from_slice(&stored[i * INLINE_KEY_LEN..]) & masks[i])
+    }
+
+    /// Adds the stations of `other` to this table's, finding each as a row of its name would.
+    /// Long names take the same number of chunks as in `record_long_row`, which their slot depends on
+    fn merge(&mut self, other: &StationTable) {
+        for slot in other.occupied_slots() {
+            let merged = if slot.len < INLINE_KEY_LEN {
+                self.find_short_slot(slot.key, slot.len)
+            } else if slot.len < 2 * INLINE_KEY_LEN {
+                self.find_long_name_slot(slot.key, slot.len, &other.stored_tail::<1>(slot))
+            } else {
+                let tail = other.stored_tail::<{ LONG_TAIL_LEN / INLINE_KEY_LEN }>(slot);
+                self.find_long_name_slot(slot.key, slot.len, &tail)
+            };
+            merged.stats += slot.stats;
+        }
+    }
+
+    /// The stations sorted by name. Sorted by their first 16 bytes as a number, which tells nearly all names
+    /// apart without reaching for the bytes of long names
+    fn sorted_stations(&self) -> Vec<Station<'_>> {
+        let mut stations: Vec<_> = self
+            .occupied_slots()
             .map(|slot| {
-                let name = if slot.len < INLINE_KEY_LEN {
-                    slot.key
-                        .iter()
-                        .flat_map(|word| word.to_le_bytes())
-                        .take(slot.len)
-                        .collect()
+                let key = u128::from(slot.key[0]) | u128::from(slot.key[1]) << 64;
+                let (prefix, long_name) = if slot.len < INLINE_KEY_LEN {
+                    // without the ';' after the name, so that a name sorts before those it is the start of
+                    (key & !(u128::MAX << (8 * slot.len)), &[][..])
                 } else {
-                    self.long_names[slot.long_name_offset..][..slot.len].to_vec()
+                    (key, &self.long_names[slot.long_name_offset..][..slot.len])
                 };
-                (name, slot.stats)
+                Station {
+                    prefix: prefix.swap_bytes(),
+                    long_name,
+                    len: slot.len,
+                    stats: slot.stats,
+                }
             })
-            .collect()
+            .collect();
+        stations.sort_unstable_by(|a, b| {
+            (a.prefix, a.long_name, a.len).cmp(&(b.prefix, b.long_name, b.len))
+        });
+        stations
+    }
+}
+
+/// A station of `StationTable::sorted_stations`
+struct Station<'a> {
+    /// The name's first 16 bytes, zero past a shorter name, as a big-endian number
+    prefix: u128,
+    /// The whole name if it is at least 16 bytes long, empty otherwise
+    long_name: &'a [u8],
+    len: usize,
+    stats: WeatherStationStats,
+}
+impl Station<'_> {
+    fn write_name(&self, output: &mut Vec<u8>) {
+        if self.long_name.is_empty() {
+            output.extend_from_slice(&self.prefix.to_be_bytes()[..self.len]);
+        } else {
+            output.extend_from_slice(self.long_name);
+        }
     }
 }
 
@@ -601,9 +695,11 @@ mod tests {
     use crate::parse_name;
     use crate::parse_temperature;
     use crate::record_row;
+    use crate::round_to_tenths;
     use crate::slot_index;
     use crate::split_lines;
     use crate::thread_count;
+    use crate::write_tenths;
     use crate::ChunkQueue;
     use crate::StationTable;
     use crate::WeatherStationStats;
@@ -622,11 +718,22 @@ mod tests {
     fn thread_count_rejects_zero() {
         thread_count(Some("0".into()), 8);
     }
+    /// The stations of `stations` sorted by name, each with its name
+    fn named_stations(stations: &StationTable) -> Vec<(Vec<u8>, WeatherStationStats)> {
+        let sorted = stations.sorted_stations();
+        let named = sorted.iter().map(|station| {
+            let mut name = Vec::new();
+            station.write_name(&mut name);
+            (name, station.stats)
+        });
+        named.collect()
+    }
+
     /// Records the first line of `buf`, returning its station name, measurement and length
     fn record_first_row(buf: &[u8]) -> (Vec<u8>, i64, usize) {
         let mut stations = StationTable::new();
         let line_len = record_row(buf, &mut stations, 0);
-        let [(name, stats)] = stations.into_stations().try_into().unwrap();
+        let [(name, stats)] = named_stations(&stations).try_into().unwrap();
         (name, stats.sum, line_len)
     }
 
@@ -743,6 +850,88 @@ mod tests {
         }
     }
 
+    /// `value` as `write_tenths` writes it after `round_to_tenths`
+    fn tenths_text(value: f64) -> String {
+        let (negative, tenths) = round_to_tenths(value);
+        let mut output = Vec::new();
+        write_tenths(&mut output, negative, tenths);
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn round_to_tenths_writes_means_as_formatting_does() {
+        // exact halves, such as 5 / 10 / 2, and values just off them
+        for count in 1..=200 {
+            for sum in -2_000i64..=2_000 {
+                let mean = WeatherStationStats {
+                    min: 0,
+                    max: 0,
+                    sum,
+                    count,
+                }
+                .mean();
+                assert_eq!(tenths_text(mean), format!("{mean:.1}"), "{sum} / {count}");
+            }
+        }
+        for value in [
+            0.0, -0.0, 0.05, -0.05, 0.25, -0.25, 99.95, -99.95, 1e-300, -1e-300, 5e-324,
+        ] {
+            assert_eq!(tenths_text(value), format!("{value:.1}"), "{value:e}");
+        }
+    }
+
+    #[test]
+    fn merge_matches_recording_every_row_into_one_table() {
+        let data = std::fs::read("samples/measurements-10000-unique-keys.txt").unwrap();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let record = |range: std::ops::Range<usize>| {
+            let mut stations = StationTable::new();
+            let mut start = range.start;
+            while start < range.end {
+                start = record_row(&buf, &mut stations, start);
+            }
+            stations
+        };
+        let half = data.len() / 2;
+        let middle = half + data[half..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        let mut merged = record(0..middle);
+        merged.merge(&record(middle..data.len()));
+        merged.merge(&record(0..middle));
+        let mut expected = record(0..data.len());
+        expected.merge(&record(0..middle));
+        assert_eq!(named_stations(&merged), named_stations(&expected));
+    }
+
+    #[test]
+    fn sorted_stations_sorts_names_by_their_bytes() {
+        let names = [
+            "b",
+            "a",
+            "ab",
+            "a!",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaab",
+        ];
+        let data: Vec<u8> = names
+            .iter()
+            .flat_map(|name| format!("{name};1.0\n").into_bytes())
+            .collect();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let mut stations = StationTable::new();
+        let mut start = 0;
+        while start < data.len() {
+            start = record_row(&buf, &mut stations, start);
+        }
+        let mut expected: Vec<_> = names.map(|name| name.as_bytes().to_vec()).into();
+        expected.sort();
+        let sorted: Vec<_> = named_stations(&stations)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(sorted, expected);
+    }
+
     #[test]
     fn slot_index_separates_equal_changes_to_both_key_words() {
         let index = |name: &[u8]| slot_index(key_of(name));
@@ -766,9 +955,7 @@ mod tests {
         let mut stations = StationTable::new();
         let (starts, ends) = split_lines::<K>(buf, until);
         let consumed = parse_lanes(buf, &mut stations, starts, ends)[K - 1];
-        let mut result = stations.into_stations();
-        result.sort_by(|a, b| a.0.cmp(&b.0));
-        (result, consumed)
+        (named_stations(&stations), consumed)
     }
 
     #[test]
@@ -782,8 +969,7 @@ mod tests {
         while consumed < until {
             consumed = record_row(&buf, &mut stations, consumed);
         }
-        let mut expected = stations.into_stations();
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = named_stations(&stations);
         assert_eq!(
             parse_in_lanes::<1>(&buf, until),
             (expected.clone(), consumed)
@@ -805,8 +991,7 @@ mod tests {
         while consumed < data.len() {
             consumed = record_row(&buf, &mut stations, consumed);
         }
-        let mut expected = stations.into_stations();
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = named_stations(&stations);
         assert_eq!(
             parse_in_lanes::<2>(&buf, data.len()),
             (expected.clone(), consumed)
@@ -932,12 +1117,10 @@ mod tests {
         while start < data.len() {
             start = record_row(&buf, &mut stations, start);
         }
-        let mut recorded: Vec<_> = stations
-            .into_stations()
+        let recorded: Vec<_> = named_stations(&stations)
             .into_iter()
             .map(|(name, stats)| (name, stats.min, stats.max, stats.count))
             .collect();
-        recorded.sort();
         let mut expected: Vec<_> = names.into_iter().map(|name| (name, -20, 10, 2)).collect();
         expected.sort();
         assert_eq!(recorded, expected);
