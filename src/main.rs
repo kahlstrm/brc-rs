@@ -160,39 +160,31 @@ fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
     }
 }
 
-/// Smallest chunk claimed from a `ChunkQueue`, so that the last chunks still amortize their seeks and reads
-const MIN_CHUNK_LEN: u64 = 1 << 20;
+/// Bytes per chunk claimed from a `ChunkQueue`. Measured: 2 to 16 MiB are equally fast. 1 MiB was 1% slower, as
+/// each chunk costs reads of the lines its bounds cut and a last, partly filled buffer, and 64 MiB was 6% slower on
+/// the 10,000-station set, where a thread claiming the last chunk late kept the others waiting
+const CHUNK_LEN: u64 = 4 << 20;
 
-/// Byte ranges of a file claimed by threads one at a time, each a quarter of the remaining bytes' share per thread,
-/// but at least `min_len`. Equal chunks, one per thread, finished tens of milliseconds apart as threads ran at
-/// different speeds: with chunks shrinking towards the end, the threads finishing first claim the last ones
+/// Byte ranges of a file, `chunk_len` bytes each but the last, claimed by threads one at a time. With one equal
+/// chunk per thread, threads running at different speeds finished tens of milliseconds apart: taking chunks as
+/// they go, they finish within one chunk's time of each other
 struct ChunkQueue {
     next: AtomicU64,
     file_len: u64,
-    divisor: u64,
-    min_len: u64,
+    chunk_len: u64,
 }
 impl ChunkQueue {
-    fn new(file_len: u64, thread_count: usize, min_len: u64) -> Self {
+    fn new(file_len: u64, chunk_len: u64) -> Self {
         ChunkQueue {
             next: AtomicU64::new(0),
             file_len,
-            divisor: 4 * thread_count as u64,
-            min_len: min_len.max(1),
+            chunk_len: chunk_len.max(1),
         }
     }
     /// The next unclaimed range, which may start and end within lines, `None` when the file is all claimed
     fn claim(&self) -> Option<Range<u64>> {
-        let chunk_end = |start: u64| {
-            let len = ((self.file_len - start) / self.divisor).max(self.min_len);
-            (start + len).min(self.file_len)
-        };
-        self.next
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |start| {
-                (start < self.file_len).then(|| chunk_end(start))
-            })
-            .ok()
-            .map(|start| start..chunk_end(start))
+        let start = self.next.fetch_add(self.chunk_len, Ordering::Relaxed);
+        (start < self.file_len).then(|| start..(start + self.chunk_len).min(self.file_len))
     }
     /// The lines starting within the next unclaimed range, `None` when the file is all claimed. Empty if no line
     /// starts within the range: the line it is in belongs to the range before
@@ -227,7 +219,7 @@ fn calc(file_name: Option<String>) -> String {
             .map(NonZeroUsize::get)
             .unwrap_or(1),
     );
-    let queue = ChunkQueue::new(file_len, thread_count, MIN_CHUNK_LEN);
+    let queue = ChunkQueue::new(file_len, CHUNK_LEN);
     let stations = thread::scope(|s| {
         let handles = (0..thread_count)
             .map(|_| {
@@ -864,7 +856,7 @@ mod tests {
             .flat_map(|i| format!("{}{i};{i}.0\n", "s".repeat(i % 7)).into_bytes())
             .collect();
         let len = input.len() as u64;
-        for (count, min_len) in [
+        for (count, chunk_len) in [
             (1, 1),
             (2, 1),
             (3, 7),
@@ -873,7 +865,7 @@ mod tests {
             (50, 1),
             (3, 1 << 20),
         ] {
-            let queue = ChunkQueue::new(len, count, min_len);
+            let queue = ChunkQueue::new(len, chunk_len);
             let mut ranges: Vec<_> = std::thread::scope(|s| {
                 let handles: Vec<_> = (0..count)
                     .map(|_| {
@@ -890,7 +882,7 @@ mod tests {
             });
             ranges.retain(|range| !range.is_empty());
             ranges.sort_by_key(|range| range.start);
-            let context = format!("{count} threads, {min_len}: {ranges:?}");
+            let context = format!("{count} threads, {chunk_len}: {ranges:?}");
             assert_eq!(ranges.first().map(|r| r.start), Some(0), "{context}");
             assert_eq!(ranges.last().map(|r| r.end), Some(len), "{context}");
             assert!(
