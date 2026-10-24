@@ -6,6 +6,7 @@ use std::{
     num::NonZeroUsize,
     ops::{Add, Range},
     simd::{cmp::SimdPartialEq, u64x2, u8x16, ToBytes},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
 };
 
@@ -148,7 +149,7 @@ fn parse_temperature(word: u64) -> (i64, usize) {
     (value, (dot_bit / 8) as usize + 3)
 }
 
-/// One thread is spawned per chunk, so this is both the chunk and the thread count.
+/// The number of threads spawned, each claiming chunks from a shared `ChunkQueue` until it is empty
 fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
     match brc_threads {
         Some(s) => s
@@ -158,46 +159,84 @@ fn thread_count(brc_threads: Option<String>, parallelism: usize) -> usize {
         None => parallelism,
     }
 }
-/// Splits the file into at most `count` ranges of about equal size, each ending after a '\n' or at the file's end
-fn split_file(mut f: impl BufRead + Seek, file_len: u64, count: usize) -> Vec<Range<u64>> {
-    let chunk_size = file_len / count as u64 + 1;
-    let mut rest_of_line = Vec::with_capacity(MAX_LINE_LEN);
-    let mut ranges = Vec::with_capacity(count);
-    let mut start = 0;
-    while start < file_len {
-        let at = start + chunk_size;
-        let end = if at >= file_len {
-            file_len
-        } else {
-            f.seek(SeekFrom::Start(at)).unwrap();
-            rest_of_line.clear();
-            at + f.read_until(b'\n', &mut rest_of_line).unwrap() as u64
-        };
-        ranges.push(start..end);
-        start = end;
-    }
-    ranges
+
+/// Bytes per chunk claimed from a `ChunkQueue`. Measured: 2 to 16 MiB are equally fast. 1 MiB was 1% slower, as
+/// each chunk costs reads of the lines its bounds cut and a last, partly filled buffer, and 64 MiB was 6% slower on
+/// the 10,000-station set, where a thread claiming the last chunk late kept the others waiting
+const CHUNK_LEN: u64 = 4 << 20;
+
+/// Byte ranges of a file, `chunk_len` bytes each but the last, claimed by threads one at a time. With one equal
+/// chunk per thread, threads running at different speeds finished tens of milliseconds apart: taking chunks as
+/// they go, they finish within one chunk's time of each other
+struct ChunkQueue {
+    next: AtomicU64,
+    file_len: u64,
+    chunk_len: u64,
 }
+impl ChunkQueue {
+    fn new(file_len: u64, chunk_len: u64) -> Self {
+        ChunkQueue {
+            next: AtomicU64::new(0),
+            file_len,
+            chunk_len: chunk_len.max(1),
+        }
+    }
+    /// The next unclaimed range, which may start and end within lines, `None` when the file is all claimed
+    fn claim(&self) -> Option<Range<u64>> {
+        let start = self.next.fetch_add(self.chunk_len, Ordering::Relaxed);
+        (start < self.file_len).then(|| start..(start + self.chunk_len).min(self.file_len))
+    }
+    /// The lines starting within the next unclaimed range, `None` when the file is all claimed. Empty if no line
+    /// starts within the range: the line it is in belongs to the range before
+    fn claim_lines(&self, mut f: impl Read + Seek) -> Option<Range<u64>> {
+        let claimed = self.claim()?;
+        let start = line_start_from(&mut f, claimed.start, self.file_len);
+        let end = line_start_from(&mut f, claimed.end, self.file_len);
+        Some(start..end)
+    }
+}
+
+/// The first line start at or after `at`, or `file_len` if there is none
+fn line_start_from(mut f: impl Read + Seek, at: u64, file_len: u64) -> u64 {
+    if at == 0 || at >= file_len {
+        return at.min(file_len);
+    }
+    // a line starts at `at` if the byte before it is a '\n'
+    f.seek(SeekFrom::Start(at - 1)).unwrap();
+    let mut rest_of_line = Vec::with_capacity(MAX_LINE_LEN);
+    let read = BufReader::with_capacity(MAX_LINE_LEN, f)
+        .read_until(b'\n', &mut rest_of_line)
+        .unwrap();
+    at - 1 + read as u64
+}
+
 fn calc(file_name: Option<String>) -> String {
     let file_name = file_name.unwrap_or("measurements.txt".into());
-    let f = File::open(&file_name).unwrap();
-    let file_len = f.metadata().unwrap().len();
+    let file_len = File::open(&file_name).unwrap().metadata().unwrap().len();
     let thread_count = thread_count(
         std::env::var("BRC_THREADS").ok(),
         std::thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1),
     );
-    let chunks = split_file(BufReader::new(f), file_len, thread_count);
+    let queue = ChunkQueue::new(file_len, CHUNK_LEN);
     let stations = thread::scope(|s| {
-        let handles = chunks
-            .into_iter()
-            .map(|c| {
-                let file_name = &file_name;
+        let handles = (0..thread_count)
+            .map(|_| {
+                let (file_name, queue) = (&file_name, &queue);
                 s.spawn(move || {
-                    let mut f = File::open(file_name).unwrap();
-                    f.seek(SeekFrom::Start(c.start)).unwrap();
-                    aggregate_measurements(f.take(c.end - c.start))
+                    let f = File::open(file_name).unwrap();
+                    let mut stations = StationTable::new();
+                    let mut buf = [0; CHUNK_SIZE + PADDING];
+                    while let Some(lines) = queue.claim_lines(&f) {
+                        (&f).seek(SeekFrom::Start(lines.start)).unwrap();
+                        aggregate_measurements(
+                            &mut stations,
+                            &mut buf,
+                            (&f).take(lines.end - lines.start),
+                        );
+                    }
+                    stations.into_stations()
                 })
             })
             .collect::<Vec<_>>();
@@ -516,9 +555,12 @@ fn parse_lanes<const K: usize>(
     }
     cursors
 }
-fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStationStats)> {
-    let mut stations = StationTable::new();
-    let mut buf = [0; CHUNK_SIZE + PADDING];
+/// Records the lines `kontsa` reads in `stations`, read into `buf`, which a thread reuses for all its chunks
+fn aggregate_measurements(
+    stations: &mut StationTable,
+    buf: &mut [u8; CHUNK_SIZE + PADDING],
+    mut kontsa: impl Read,
+) {
     let mut filled = 0;
     loop {
         let bytes_read = kontsa.read(&mut buf[filled..CHUNK_SIZE]).unwrap();
@@ -532,12 +574,12 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
         };
         // the precondition of `split_lines`
         let consumed = if parse_until >= LANES * MAX_LINE_LEN {
-            let (starts, ends) = split_lines::<LANES>(&buf, parse_until);
-            parse_lanes(&buf, &mut stations, starts, ends)[LANES - 1]
+            let (starts, ends) = split_lines::<LANES>(buf, parse_until);
+            parse_lanes(buf, stations, starts, ends)[LANES - 1]
         } else {
             let mut start = 0;
             while start < parse_until {
-                start = record_row(&buf, &mut stations, start);
+                start = record_row(buf, stations, start);
             }
             start
         };
@@ -547,7 +589,6 @@ fn aggregate_measurements(mut kontsa: impl Read) -> Vec<(Vec<u8>, WeatherStation
         buf.copy_within(consumed..filled, 0);
         filled -= consumed;
     }
-    stations.into_stations()
 }
 
 #[cfg(test)]
@@ -561,9 +602,9 @@ mod tests {
     use crate::parse_temperature;
     use crate::record_row;
     use crate::slot_index;
-    use crate::split_file;
     use crate::split_lines;
     use crate::thread_count;
+    use crate::ChunkQueue;
     use crate::StationTable;
     use crate::WeatherStationStats;
     use crate::PADDING;
@@ -810,23 +851,47 @@ mod tests {
     }
 
     #[test]
-    fn split_file_splits_at_line_starts_into_at_most_count_ranges() {
+    fn chunk_queue_covers_the_file_with_line_ranges_claimed_from_any_threads() {
         let input: Vec<u8> = (0..50)
             .flat_map(|i| format!("{}{i};{i}.0\n", "s".repeat(i % 7)).into_bytes())
             .collect();
         let len = input.len() as u64;
-        for count in [1, 2, 3, 8, 50, 1000] {
-            let ranges = split_file(std::io::Cursor::new(&input), len, count);
-            assert!(ranges.len() <= count, "{count}: {ranges:?}");
-            assert_eq!(ranges.first().map(|r| r.start), Some(0), "{count}");
-            assert_eq!(ranges.last().map(|r| r.end), Some(len), "{count}");
-            for range in &ranges {
-                assert!(!range.is_empty(), "{count}: {ranges:?}");
-                assert_eq!(input[range.end as usize - 1], b'\n', "{count}: {ranges:?}");
-            }
+        for (count, chunk_len) in [
+            (1, 1),
+            (2, 1),
+            (3, 7),
+            (8, 1),
+            (8, 64),
+            (50, 1),
+            (3, 1 << 20),
+        ] {
+            let queue = ChunkQueue::new(len, chunk_len);
+            let mut ranges: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..count)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut f = std::io::Cursor::new(&input);
+                            std::iter::from_fn(|| queue.claim_lines(&mut f)).collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            });
+            ranges.retain(|range| !range.is_empty());
+            ranges.sort_by_key(|range| range.start);
+            let context = format!("{count} threads, {chunk_len}: {ranges:?}");
+            assert_eq!(ranges.first().map(|r| r.start), Some(0), "{context}");
+            assert_eq!(ranges.last().map(|r| r.end), Some(len), "{context}");
             assert!(
                 ranges.windows(2).all(|w| w[0].end == w[1].start),
-                "{count}: {ranges:?}"
+                "{context}"
+            );
+            assert!(
+                ranges.iter().all(|r| input[r.end as usize - 1] == b'\n'),
+                "{context}"
             );
         }
     }
