@@ -666,7 +666,16 @@ What's left is mostly the long names of the 10K dataset, which still take about 
 
 ## Part 3: A port to Mojo
 
-How close does [Mojo](https://mojolang.org/) get with the same rules? `mojo/` holds a port of the program above to Mojo 1.2: the same algorithm, Mojo's standard library only, and safe code only, so no `UnsafePointer`, none of the standard library's `unsafe_` functions and no calls into C. Indexing stays bounds-checked, as Mojo does by default on CPUs.
+How close does [Mojo](https://mojolang.org/) get with the same rules? `mojo/` holds a port to Mojo 1.2 with the same algorithm, using only Mojo's standard library and safe code: no `UnsafePointer`, none of the standard library's `unsafe_` functions, no calls into C, and indexing stays bounds-checked.
+
+Mojo, from Modular, has Python's syntax and compiles to native code through MLIR and LLVM. Much is familiar from Rust: single ownership, a borrow checker, traits and generics. The differences that mattered here:
+
+- Arguments are read-only borrows unless marked `mut` or `var` (owned, handed over with `^`), and references carry an *origin* in place of a lifetime.
+- Values are destroyed after their last use, not at the end of their scope.
+- `comptime for` unrolls loops, and constants are computed by ordinary functions.
+- SIMD vectors are a built-in type, `SIMD[DType.uint8, 16]`.
+- Failing functions are marked `raises` instead of returning a `Result`.
+- The standard library has files, pipes and processes, but no threads.
 
 On the same machine, with both files in the page cache, the median of 15 runs of each, alternating between the two:
 
@@ -675,17 +684,20 @@ On the same machine, with both files in the page cache, the median of 15 runs of
 | brc-rs | 0.664 s | 0.312 s |
 | Mojo port | 0.651 s | 0.309 s |
 
-Most of the Rust version carries over: the 16-byte keys with the ';' in them, the branchless temperature parsing, packed long names, parsing in lanes. What differs:
+The program runs one process per core. The first writes the bounds of the file's chunks into a pipe and starts the rest as copies of itself. Each process takes chunks from that pipe until it is empty, and the copies send their tables back to the first, which merges and prints them. Its row path mirrors the Rust one function for function. At about 790 lines against 550 it is longer, mostly because of the processes and pipes.
 
-- **Processes instead of threads.** Mojo's standard library has no threads: its thread pool is only reachable through async tasks, which the compiler itself calls experimental, and `parallelize` moved to the MAX library. So the program starts copies of itself with `std.os.Process`, which send their stations back through pipes. They take their work from a pipe too: it holds the bounds of the file's chunks, 16 bytes each, and as reads of a pipe never interleave, each read takes one chunk whole. Each chunk is a quarter of what is left per process, so that the chunks shrink towards the end and every process finishes within a millisecond of the others, which also hides that workers start several milliseconds late. Every Mojo process spends about 8 ms setting up its runtime before `main`, which is where most of the remaining difference on these files comes from.
-- **Bounds checks.** A failed slice check in Mojo's standard library may return, and it gets the slice's bounds by reference, so after one, LLVM no longer knows anything about them and keeps every later check. Checking first with a helper that calls `abort()`, which doesn't return, lets it drop both. Mojo's `Int` arithmetic may wrap, so LLVM can't prove `cursor + 128` in bounds from `cursor < end` either; lanes instead stop at unsigned bounds clamped to the buffer's length, a constant, from which its range analysis proves every row's loads in bounds.
-- **Masks in the read buffer.** The masks that cut a name off at its ';' are kept right after the read buffer's data, so that loading them needs no register of their own. A `comptime` table would be copied to the stack each time it's used.
-- **Half a cache line per station.** Slots are 32 bytes, with 16-bit minimums and maximums and a 32-bit count: the 10K stations' slots take half as many cache lines. A long name's slot keeps its length and where it is stored in place of its second 8 bytes, tagged with a 0xFF byte, which UTF-8 never has, so that no short name's key can match it.
-- **Branch hints.** `likely` and `unlikely` from `std.sys.intrinsics` mark the rare paths, as `cold_path()` and `#[cold]` do in the Rust version. With them, LLVM keeps the spills of the calls on those paths out of the hot loop, and four lanes become faster than three.
+### How the port went
 
-The Mojo standard library had two surprises on the way: `Process.run` passes a garbled copy of any argument built at run time that is short enough to be stored inside its `String`, so workers get their job through an environment variable instead, and a `Pipe` is closed as soon as it is last used, which happened to be before the workers had read from it.
+A straight translation was 1.5× slower on one core: 0.374 s against 0.251 s on 50 million rows of the default data, and 1.60 s against 1.02 s on 100 million rows of the 10K set. As in Part 2, it improved one change at a time, measured on both datasets, comparing instructions per row and the hot loop's assembly with the Rust version's.
 
-What didn't work: parsing a batch of rows first and looking their stations up after, a table of their own for long names, smaller tables, inlining the long names' path, and more processes than cores.
+- **Bounds checks were most of the gap.** A failed check in Mojo's standard library may return, and it takes the bounds by reference, so LLVM keeps them in memory and drops no later check. Checking each 128-byte row once in a helper that calls `abort()`, which never returns, and stopping lanes at unsigned bounds clamped to the buffer's length, leaves the row loads with no checks, as in Rust.
+- **Register pressure came next.** The fixes were masks kept right after the read buffer's data instead of in a `comptime` table, which got copied to the stack on every use, and `likely`/`unlikely` hints on the rare paths, with which four lanes beat three.
+- **Smaller slots helped the 10K set.** Slots are 32 bytes, with 16-bit minimums and maximums. A long name's slot keeps its length and offset in its second 8 bytes, tagged with a 0xFF byte that UTF-8 never has.
+- **Parallelism took the longest.** Equal chunks per process left some up to 45 ms behind the others, and every process spends about 8 ms starting Mojo's runtime. Chunks that shrink towards the end, taken from the shared pipe, fixed the first and mostly hide the second. Two standard-library bugs got in the way: `Process.run` garbles short arguments built at run time, so workers get their job through an environment variable; and a `Pipe` closes after its last use, so the chunk queue closed before the workers had read it.
+
+In the end the port went from 0.889 s to 0.651 s on the billion rows, and from 0.370 s to 0.309 s on the 10K set.
+
+What didn't work: parsing a batch of rows before looking any of them up, a separate table for long names, smaller tables, inlining the long names' path, and more processes than cores.
 
 ## Development
 
