@@ -4,5 +4,7 @@ measurements.out
 profile.json
 test*
 !test*.rs
+!test*.mojo
 /measurements-10k.txt
 !/tests/
+/mojo/.venv

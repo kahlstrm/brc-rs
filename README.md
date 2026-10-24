@@ -664,6 +664,41 @@ The things Part 1 left for later, branchless parsing and memory-mapped files, we
 What's left is mostly the long names of the 10K dataset, which still take about half of its time on a sixth of its rows.
 
 
+## Part 3: A port to Mojo
+
+How close does [Mojo](https://mojolang.org/) get with the same rules? `mojo/` holds a port to Mojo 1.2 with the same algorithm, using only Mojo's standard library and safe code: no `UnsafePointer`, none of the standard library's `unsafe_` functions, no calls into C, and indexing stays bounds-checked.
+
+Mojo, from Modular, has Python's syntax and compiles to native code through MLIR and LLVM. Much is familiar from Rust: single ownership, a borrow checker, traits and generics. The differences that mattered here:
+
+- Arguments are read-only borrows unless marked `mut` or `var` (owned, handed over with `^`), and references carry an *origin* in place of a lifetime.
+- Values are destroyed after their last use, not at the end of their scope.
+- `comptime for` unrolls loops, and constants are computed by ordinary functions.
+- SIMD vectors are a built-in type, `SIMD[DType.uint8, 16]`.
+- Failing functions are marked `raises` instead of returning a `Result`.
+- The standard library has files, pipes and processes, but no threads.
+
+On the same machine, with both files in the page cache, the median of 15 runs of each, alternating between the two:
+
+| Solution | 1B rows | 10K stations |
+| --- | --- | --- |
+| brc-rs | 0.664 s | 0.312 s |
+| Mojo port | 0.651 s | 0.309 s |
+
+The program runs one process per core. The first writes the bounds of the file's chunks into a pipe and starts the rest as copies of itself. Each process takes chunks from that pipe until it is empty, and the copies send their tables back to the first, which merges and prints them. Its row path mirrors the Rust one function for function. At about 790 lines against 550 it is longer, mostly because of the processes and pipes.
+
+### How the port went
+
+A straight translation was 1.5× slower on one core: 0.374 s against 0.251 s on 50 million rows of the default data, and 1.60 s against 1.02 s on 100 million rows of the 10K set. As in Part 2, it improved one change at a time, measured on both datasets, comparing instructions per row and the hot loop's assembly with the Rust version's.
+
+- **Bounds checks were most of the gap.** A failed check in Mojo's standard library may return, and it takes the bounds by reference, so LLVM keeps them in memory and drops no later check. Checking each 128-byte row once in a helper that calls `abort()`, which never returns, and stopping lanes at unsigned bounds clamped to the buffer's length, leaves the row loads with no checks, as in Rust.
+- **Register pressure came next.** The fixes were masks kept right after the read buffer's data instead of in a `comptime` table, which got copied to the stack on every use, and `likely`/`unlikely` hints on the rare paths, with which four lanes beat three.
+- **Smaller slots helped the 10K set.** Slots are 32 bytes, with 16-bit minimums and maximums. A long name's slot keeps its length and offset in its second 8 bytes, tagged with a 0xFF byte that UTF-8 never has.
+- **Parallelism took the longest.** Equal chunks per process left some up to 45 ms behind the others, and every process spends about 8 ms starting Mojo's runtime. Chunks that shrink towards the end, taken from the shared pipe, fixed the first and mostly hide the second. Two standard-library bugs got in the way: `Process.run` garbles short arguments built at run time, so workers get their job through an environment variable; and a `Pipe` closes after its last use, so the chunk queue closed before the workers had read it.
+
+In the end the port went from 0.889 s to 0.651 s on the billion rows, and from 0.370 s to 0.309 s on the 10K set.
+
+What didn't work: parsing a batch of rows before looking any of them up, a separate table for long names, smaller tables, inlining the long names' path, and more processes than cores.
+
 ## Development
 
 ### Prerequisites
@@ -693,6 +728,26 @@ cargo test
 ```
 
 This tests the example files inside `samples`-directory
+
+### The Mojo port
+
+`nix develop .#mojo` installs the Mojo version pinned in `mojo/requirements.txt` into `mojo/.venv`. Without Nix, `pip install --requirement mojo/requirements.txt` installs it into the active Python environment.
+From the repository root:
+
+```sh
+mojo build -I mojo -o target/mojo/brc mojo/main.mojo
+target/mojo/brc measurements.txt
+```
+
+Like `mojo build` by default, it builds for the CPU of the machine building it. `BRC_THREADS` sets the number of processes, one per core by default.
+To run the tests, which compare the output for every file in `samples` too:
+
+```sh
+mojo build -I mojo -o target/mojo/test_brc mojo/test_brc.mojo
+target/mojo/test_brc
+```
+
+`mojo/bench.sh <filename>` builds both versions and compares them with hyperfine.
 
 ### Generating measurements
 
