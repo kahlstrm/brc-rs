@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
-    ops::{AddAssign, Range},
+    ops::Range,
     simd::{cmp::SimdPartialEq, u64x2, u8x16, ToBytes},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -21,38 +21,8 @@ struct WeatherStationStats {
     count: usize,
 }
 impl WeatherStationStats {
-    /// No measurements yet: any measurement replaces its min and max
-    const EMPTY: Self = WeatherStationStats {
-        min: i64::MAX,
-        max: i64::MIN,
-        sum: 0,
-        count: 0,
-    };
-    fn record(&mut self, measurement: i64) {
-        // new extremes get rare after a station's first rows, so branches beat loading and storing both always
-        if measurement < self.min {
-            std::hint::cold_path();
-            self.min = measurement;
-        }
-        if measurement > self.max {
-            std::hint::cold_path();
-            self.max = measurement;
-        }
-        self.sum += measurement;
-        self.count += 1;
-    }
     fn mean(&self) -> f64 {
         self.sum as f64 / 10.0 / self.count as f64
-    }
-}
-impl AddAssign for WeatherStationStats {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = WeatherStationStats {
-            min: self.min.min(rhs.min),
-            max: self.max.max(rhs.max),
-            sum: self.sum + rhs.sum,
-            count: self.count + rhs.count,
-        }
     }
 }
 /// A row's loads end within a line of its start, so read buffers keep a line of padding after the data:
@@ -370,16 +340,80 @@ fn long_tails_match<const N: usize>(stored: &[u8], tail: &LongTail<N>, tail_len:
     differing == u8x16::splat(0)
 }
 
-/// One cache line per station, so a lookup and its update touch a single line
-#[repr(align(64))]
+/// Half a cache line per station, so that a lookup and its update touch a single line, and the 10,000 stations'
+/// slots take half as many lines as with a line each
+#[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
 struct Slot {
+    /// A short name's bytes and the ';' after it, or a long name's first 8 bytes and its `LONG_NAME_TAG` word
     key: [u64; 2],
-    /// Zero marks an empty slot, as station names are at least one byte long
-    len: usize,
-    /// Where a name of at least 16 bytes starts in `StationTable::long_names`
-    long_name_offset: usize,
-    stats: WeatherStationStats,
+    /// Zero marks an empty slot: a station is recorded as soon as it claims one. 32 bits are enough for a billion
+    /// rows
+    count: u32,
+    min: i16,
+    max: i16,
+    sum: i64,
+}
+const _: () = assert!(size_of::<Slot>() == 32);
+impl Slot {
+    /// No measurements yet: any measurement replaces its min and max
+    fn claimed(key: [u64; 2]) -> Self {
+        Slot {
+            key,
+            sum: 0,
+            count: 0,
+            min: i16::MAX,
+            max: i16::MIN,
+        }
+    }
+    fn record(&mut self, measurement: i64) {
+        let value = measurement as i16;
+        // new extremes get rare after a station's first rows, so branches beat loading and storing both always
+        if value < self.min {
+            std::hint::cold_path();
+            self.min = value;
+        }
+        if value > self.max {
+            std::hint::cold_path();
+            self.max = value;
+        }
+        self.sum += measurement;
+        self.count += 1;
+    }
+    fn stats(&self) -> WeatherStationStats {
+        WeatherStationStats {
+            min: self.min.into(),
+            max: self.max.into(),
+            sum: self.sum,
+            count: self.count as usize,
+        }
+    }
+    fn add(&mut self, other: &Slot) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
+    }
+    fn is_long(&self) -> bool {
+        self.key[1] & LONG_NAME_TAG == LONG_NAME_TAG
+    }
+    fn name_len(&self) -> usize {
+        if self.is_long() {
+            (self.key[1] >> 32 & 0xFF) as usize
+        } else {
+            let bytes = self.key.iter().flat_map(|word| word.to_le_bytes());
+            bytes.take_while(|&byte| byte != b';').count()
+        }
+    }
+}
+
+/// In the second key word of the slot of a name of at least 16 bytes, above its length and where it starts in
+/// `StationTable::long_names`: UTF-8 has no 0xFF byte, so no short name's key has it
+const LONG_NAME_TAG: u64 = 0xFF << 56;
+
+/// Where the name of at least 16 bytes with the second key word `tagged` starts in `StationTable::long_names`
+fn long_name_offset(tagged: u64) -> usize {
+    (tagged & 0xFFFF_FFFF) as usize
 }
 
 /// Open-addressing table with linear probing, keyed by station name
@@ -400,25 +434,20 @@ impl StationTable {
         }
     }
 
-    /// Finds the slot of the name shorter than the inline key with `key` and `len`, claiming an empty one for
-    /// a new name. The key alone tells such names apart, as it holds the ';' after the name
+    /// Finds the slot of the name shorter than the inline key with `key`, claiming an empty one for a new name.
+    /// The key alone tells such names apart, as it holds the ';' after the name
     #[inline(always)]
-    fn find_short_slot(&mut self, key: [u64; 2], len: usize) -> &mut Slot {
+    fn find_short_slot(&mut self, key: [u64; 2]) -> &mut Slot {
         let mut i = slot_index(key);
         loop {
             let slot = &self.slots[i];
-            // compared word by word: comparing the arrays at once compiles to a 16-byte load of the key
-            // just stored as two words, which stalls as the stores can't be forwarded to it
-            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0 {
+            // compared at once, with a single 16-byte load: in 64-byte slots, whose key followed the stats, that load
+            // stalled behind the stores to them, while word by word it did not
+            if slot.key == key {
                 return &mut self.slots[i];
             }
-            if slot.len == 0 {
-                self.slots[i] = Slot {
-                    key,
-                    len,
-                    long_name_offset: 0,
-                    stats: WeatherStationStats::EMPTY,
-                };
+            if slot.count == 0 {
+                self.slots[i] = Slot::claimed(key);
                 return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
@@ -427,7 +456,9 @@ impl StationTable {
 
     /// Finds the slot of the name of `len` bytes, at least 16, whose first 16 bytes are `key`, with `tail` after
     /// them up to its end, claiming an empty one for a new name. Hashed by all its bytes, see
-    /// `long_name_slot_index`. Of a stored name of the same length, only the bytes `tail` keeps are compared
+    /// `long_name_slot_index`. Its slot keeps its first 8 bytes and, in place of the next 8, its length and where
+    /// it is stored. Of a stored name of the same length, its bytes from the 8th up to the end `tail` keeps are
+    /// compared
     #[inline(always)]
     fn find_long_name_slot<const N: usize>(
         &mut self,
@@ -435,27 +466,25 @@ impl StationTable {
         len: usize,
         tail: &LongTail<N>,
     ) -> &mut Slot {
+        let tag = LONG_NAME_TAG | (len as u64) << 32;
         let mut i = long_name_slot_index(key, tail);
         loop {
             let slot = &self.slots[i];
-            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) | (slot.len ^ len) as u64 == 0
-                && long_tails_match(
-                    &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..]
-                        [..N * INLINE_KEY_LEN],
-                    tail,
-                    len - INLINE_KEY_LEN,
-                )
-            {
-                return &mut self.slots[i];
+            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ tag) >> 32 == 0 {
+                let stored = &self.long_names[long_name_offset(slot.key[1]) + 8..];
+                if load_u64(stored, 0) == key[1]
+                    && long_tails_match(
+                        &stored[8..][..N * INLINE_KEY_LEN],
+                        tail,
+                        len - INLINE_KEY_LEN,
+                    )
+                {
+                    return &mut self.slots[i];
+                }
             }
-            if slot.len == 0 {
+            if slot.count == 0 {
                 let offset = self.long_names.len() - LONG_TAIL_LEN;
-                self.slots[i] = Slot {
-                    key,
-                    len,
-                    long_name_offset: offset,
-                    stats: WeatherStationStats::EMPTY,
-                };
+                self.slots[i] = Slot::claimed([key[0], tag | offset as u64]);
                 let key_bytes = key.iter().flat_map(|word| word.to_le_bytes());
                 let tail_bytes = tail.iter().flat_map(|chunk| chunk.to_array());
                 // the chunks whole, cut at the name's end after: taking `len` bytes copies them one at a time
@@ -470,13 +499,23 @@ impl StationTable {
     }
 
     fn occupied_slots(&self) -> impl Iterator<Item = &Slot> {
-        self.slots.iter().filter(|slot| slot.len != 0)
+        self.slots.iter().filter(|slot| slot.count != 0)
+    }
+
+    /// The first 16 bytes of the name in `slot`, which a long name's slot keeps only the first 8 of
+    fn name_key(&self, slot: &Slot) -> [u64; 2] {
+        if slot.is_long() {
+            let stored = &self.long_names[long_name_offset(slot.key[1])..];
+            [slot.key[0], load_u64(stored, 8)]
+        } else {
+            slot.key
+        }
     }
 
     /// The tail of the long name in `slot` as `parse_long_name::<N>` returns it, zero past the name
     fn stored_tail<const N: usize>(&self, slot: &Slot) -> LongTail<N> {
-        let stored = &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..];
-        let masks = tail_masks::<N>(slot.len - INLINE_KEY_LEN);
+        let stored = &self.long_names[long_name_offset(slot.key[1]) + INLINE_KEY_LEN..];
+        let masks = tail_masks::<N>(slot.name_len() - INLINE_KEY_LEN);
         std::array::from_fn(|i| u8x16::from_slice(&stored[i * INLINE_KEY_LEN..]) & masks[i])
     }
 
@@ -484,15 +523,16 @@ impl StationTable {
     /// Long names take the same number of chunks as in `record_long_row`, which their slot depends on
     fn merge(&mut self, other: &StationTable) {
         for slot in other.occupied_slots() {
-            let merged = if slot.len < INLINE_KEY_LEN {
-                self.find_short_slot(slot.key, slot.len)
-            } else if slot.len < 2 * INLINE_KEY_LEN {
-                self.find_long_name_slot(slot.key, slot.len, &other.stored_tail::<1>(slot))
+            let (key, len) = (other.name_key(slot), slot.name_len());
+            let merged = if len < INLINE_KEY_LEN {
+                self.find_short_slot(key)
+            } else if len < 2 * INLINE_KEY_LEN {
+                self.find_long_name_slot(key, len, &other.stored_tail::<1>(slot))
             } else {
                 let tail = other.stored_tail::<{ LONG_TAIL_LEN / INLINE_KEY_LEN }>(slot);
-                self.find_long_name_slot(slot.key, slot.len, &tail)
+                self.find_long_name_slot(key, len, &tail)
             };
-            merged.stats += slot.stats;
+            merged.add(slot);
         }
     }
 
@@ -502,18 +542,23 @@ impl StationTable {
         let mut stations: Vec<_> = self
             .occupied_slots()
             .map(|slot| {
-                let key = u128::from(slot.key[0]) | u128::from(slot.key[1]) << 64;
-                let (prefix, long_name) = if slot.len < INLINE_KEY_LEN {
+                let [low, high] = self.name_key(slot);
+                let key = u128::from(low) | u128::from(high) << 64;
+                let len = slot.name_len();
+                let (prefix, long_name) = if len < INLINE_KEY_LEN {
                     // without the ';' after the name, so that a name sorts before those it is the start of
-                    (key & !(u128::MAX << (8 * slot.len)), &[][..])
+                    (key & !(u128::MAX << (8 * len)), &[][..])
                 } else {
-                    (key, &self.long_names[slot.long_name_offset..][..slot.len])
+                    (
+                        key,
+                        &self.long_names[long_name_offset(slot.key[1])..][..len],
+                    )
                 };
                 Station {
                     prefix: prefix.swap_bytes(),
                     long_name,
-                    len: slot.len,
-                    stats: slot.stats,
+                    len,
+                    stats: slot.stats(),
                 }
             })
             .collect();
@@ -570,7 +615,7 @@ fn record_named_row(
     // only right for a name shorter than 16 bytes
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     if len < INLINE_KEY_LEN {
-        stations.find_short_slot(key, len).stats.record(measurement);
+        stations.find_short_slot(key).record(measurement);
         start + len + 1 + temperature_len
     } else {
         record_long_row(buf, stations, start)
@@ -605,7 +650,6 @@ fn record_long_name_row<const N: usize>(
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     stations
         .find_long_name_slot(key, len, tail)
-        .stats
         .record(measurement);
     start + len + 1 + temperature_len
 }
@@ -1124,5 +1168,31 @@ mod tests {
         let mut expected: Vec<_> = names.into_iter().map(|name| (name, -20, 10, 2)).collect();
         expected.sort();
         assert_eq!(recorded, expected);
+    }
+
+    #[test]
+    fn long_names_differing_only_in_their_second_8_bytes_get_a_slot_each() {
+        // enough names that their probes pass over one another's slots, whose keys keep only the first 8 bytes
+        let names: Vec<Vec<u8>> = (0..10_000)
+            .map(|i| format!("{}{i:08}{}", "p".repeat(8), "s".repeat(4)).into_bytes())
+            .collect();
+        let data: Vec<u8> = names
+            .iter()
+            .flat_map(|name| [name, &b";1.0\n"[..]].concat())
+            .collect();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let mut stations = StationTable::new();
+        let mut start = 0;
+        while start < data.len() {
+            start = record_row(&buf, &mut stations, start);
+        }
+        let recorded: Vec<_> = named_stations(&stations)
+            .into_iter()
+            .map(|(name, stats)| (name, stats.count))
+            .collect();
+        assert_eq!(
+            recorded,
+            names.into_iter().map(|name| (name, 1)).collect::<Vec<_>>()
+        );
     }
 }
