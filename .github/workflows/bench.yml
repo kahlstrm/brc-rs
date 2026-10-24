@@ -35,9 +35,12 @@ jobs:
           model=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p')
           [ -n "$model" ] || model=$(sysctl -n machdep.cpu.brand_string)
           echo "CPU_MODEL=$(printf '%s' "$model" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_ENV"
+          # runners of the same model may differ in the features their hypervisor exposes, which decide what
+          # target-cpu=native compiles for
+          echo "CPU_FEATURES=$(rustc --print cfg -C target-cpu=native | grep target_feature | sha256sum | cut -c1-16)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ubuntu-latest-${{ env.CPU_MODEL }}
+          shared-key: ubuntu-latest-${{ env.CPU_MODEL }}-${{ env.CPU_FEATURES }}
       - name: Build PR and base
         run: |
           cargo build --release
