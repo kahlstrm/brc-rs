@@ -281,7 +281,8 @@ fn round_to_tenths(value: f64) -> (bool, u64) {
 
 /// Bytes of a station name stored inline in its slot and compared as two words
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
-/// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
+/// A power of two, leaving a low load factor for the 10,000 stations the challenge allows. 4 MiB, which measured fastest:
+/// smaller tables collide more, and bigger ones were slower too
 const TABLE_SIZE: usize = 1 << 17;
 /// Slot of the name with the key words `key`
 fn slot_index(key: [u64; 2]) -> usize {
@@ -340,8 +341,8 @@ fn long_tails_match<const N: usize>(stored: &[u8], tail: &LongTail<N>, tail_len:
     differing == u8x16::splat(0)
 }
 
-/// Half a cache line per station, so that a lookup and its update touch a single line, and the 10,000 stations'
-/// slots take half as many lines as with a line each
+/// Half a cache line per station, so that a lookup and its update touch a single line, and twice as many slots fit
+/// in the memory of a table
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
 struct Slot {

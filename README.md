@@ -440,7 +440,7 @@ The M1 Max from Part 1 was not available, so everything below is measured on a L
 On it, the version Part 1 ended with processes the billion rows in 3.3 seconds.
 
 The other change is a second dataset. The original challenge also had a [10K variant](https://github.com/gunnarmorling/1brc#rules-and-limits) with 10,000 station names of up to 100 bytes, instead of the 413 mostly short ones in the default file.
-Its 10,000 table slots, 640 KB, no longer fit in a core's L2 cache, and around 15% of its names are longer than 16 bytes, which makes it a good way to catch optimizations that only work on short names.
+Its 10,000 stations are scattered over more of the table than fits in a core's L2 cache, and around 15% of its names are longer than 16 bytes, which makes it a good way to catch optimizations that only work on short names.
 Every change from here on was measured on both: the default 1 billion rows, and 200 million rows over 10,000 stations.
 
 Many of the tricks below come from the Java entries of the original challenge.
@@ -619,7 +619,7 @@ The same `assert!` without the first change was 12% *slower*, and three lanes wi
 
 ### Building for the machine at hand
 
-The last change is a single line in `.cargo/config.toml`:
+Another change is a single line in `.cargo/config.toml`:
 
 ```toml
 [build]
@@ -628,6 +628,26 @@ rustflags = ["-C", "target-cpu=native"]
 
 Challenge entries are built and run on the same machine, so the compiler may use every instruction the CPU has. With BMI2 and AVX, it needs 12–13% fewer instructions, and the run time dropped 7% on both datasets.
 
+### Sharing the work
+
+Each thread used to get one equal part of the file. Equal parts didn't take equal time, though: the threads finished 37–54 ms apart on the default dataset and 20–26 ms apart on the 10K one, and the first ones done sat idle.
+Now the threads claim 4 MiB chunks from a shared atomic offset until the whole file is claimed, so the threads that are ahead take the last chunks, and all of them finish within about 3 ms of each other.
+A line belongs to the chunk it starts in, and each thread keeps one table and one read buffer for all of its chunks. Both datasets got about 3% faster.
+
+At the end, the threads' tables are merged into the first one, and the results are written out from integer tenths, rounded exactly as formatting the floats would. With its 10,000 stations to merge and write, that made the 10K dataset 4% faster.
+
+### Half-size slots
+
+The slots were 64 bytes, a full cache line: the 16-byte key, the name's length, where a long name is stored, and the statistics as 64-bit numbers.
+Most of that fits in less. A billion rows need only a 32-bit count, and temperatures in tenths, between -99.9 and 99.9, fit in 16-bit minimums and maximums. With the key and a 64-bit sum, that is 32 bytes.
+
+That leaves no room for a long name's length and offset, so they go into its key: its slot keeps its first 8 bytes as the first key word, and as the second its length and offset, under a 0xFF top byte.
+UTF-8 never has a 0xFF byte, so no short name's key can match one. The 8 bytes this displaces are compared from where the name is stored, which a long name's lookup reads anyway, and a short name's length is where the ';' is in its key.
+
+On its own, that didn't pay: the 10K dataset's stations are scattered over the table, so at two slots per cache line they still touched nearly as many lines, and the default dataset's 413 stations fit in L1 either way.
+What the smaller slots left was memory. In the 4 MiB per thread that 65,536 slots used to take, twice as many fit, and with them fewer collisions. Both layouts were fastest at 4 MiB per thread; bigger tables were slower.
+With 131,072 half-size slots, the 10K dataset is 6% faster and the default one 0.5% slower on the 5950X. On a CI runner with a newer Zen 5 CPU, both were about 4% faster.
+
 ### What didn't work
 
 Not everything made it in.
@@ -635,7 +655,8 @@ Not everything made it in.
 - **Memory-mapping the file, and the Java "worker-exit" trick.** The fastest Java solutions `mmap` the file and do the work in a child process, so that unmapping 13 GB happens after the timer stops. Copying that behind an opt-in `unsafe` feature showed that most of what it hides depends on the state of the page cache: with a freshly written file unmapping takes 0.15 s, but with the file read back from disk there's nothing to hide. The default build stays with `read()`.
 - **Padding long names to a fixed size** so that comparing them needs no masking. Fewer instructions, but the padded names of the 10K dataset took 179 KB instead of 75 KB, L2 misses per row rose 15%, and one of the CI runners measured it 6% slower. Long names are stored packed.
 - **Wider vectors for long names.** With AVX2, a long name could be handled in three 32-byte chunks instead of six 16-byte ones. That was 3.5% faster on the 10K dataset, but 2% slower on the default one, where every long name fits in 32 bytes and the wider chunks only lengthen the chain of dependent steps. A version mixing both widths gained only 1%, not worth the complexity.
-- **Four lanes**, which do not fit in the registers, and **a bigger or smaller table**: 32,768 slots were 6–8% slower on the 10K dataset, and 131,072 gained nothing.
+- **Four lanes.** The compiler stops unrolling the loop over the lanes at four, which made them 11–36% slower than three. Unrolled by hand, they were within 1% of three.
+- **A smaller table**, even one whose slots would fit in L2: the extra collisions cost more than the cache misses they save. On the 10K dataset, 65,536 slots were 2–4% slower than 131,072, and 32,768 were 11–13% slower.
 
 Benchmarking in CI had its own lesson: the runners are picked at random from several AMD and Intel CPUs, all sharing their cores between two threads. Three lanes were 4% faster on my machine, but 2.3% slower in CI until the register spills were fixed. A change that saves cycles on one CPU but adds instructions or memory can lose on another.
 
@@ -645,7 +666,7 @@ On the same machine, with the file in the page cache, against native-image build
 
 | Solution | 1B rows | 10K stations |
 | --- | --- | --- |
-| brc-rs | 0.69 s | 0.30 s |
+| brc-rs | 0.67 s | 0.28 s |
 | [thomaswue](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_thomaswue.java) | 0.77 s | 0.63 s |
 | [jerrinot](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_jerrinot.java) | 0.81 s | 0.47 s |
 | [artsiomkorzun](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_artsiomkorzun.java) | 0.83 s | 0.49 s |
@@ -654,8 +675,8 @@ Not bad for safe Rust without dependencies. The comparison is not quite the orig
 
 ## Conclusion, Part 2
 
-The program now processes the billion rows in 0.69 seconds on the 5950X: 4.8× faster than where Part 1 ended on the same machine, and around 130× faster than the very first version, which takes 89 seconds on it.
-The 10K dataset went from 1.21 seconds to 0.31, 4.0× faster.
+The program now processes the billion rows in 0.67 seconds on the 5950X: 4.9× faster than where Part 1 ended on the same machine, and around 130× faster than the very first version, which takes 89 seconds on it.
+The 10K dataset went from 1.21 seconds to 0.28, 4.3× faster.
 
 Unlike in Part 1, the biggest win was not one change: it was a long series of small ones, each measured on two datasets and on whatever CPU the CI runner happened to have.
 Several of them only paid off together: three lanes needed fewer live values and the bounds checks gone first.
