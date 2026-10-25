@@ -48,3 +48,35 @@ jobs:
       - run: cargo test --verbose --all-features
       - name: Create measurements
         run: cargo r --quiet --bin create_measurements --features=generate --release 1_000_000
+
+  mojo:
+    name: mojo (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Mojo from mojo/requirements.txt
+        run: pip install --requirement mojo/requirements.txt
+      - name: Build
+        run: |
+          mkdir -p target/mojo
+          mojo build -I mojo -o target/mojo/brc mojo/main.mojo
+          mojo build -I mojo -o target/mojo/test_brc mojo/test_brc.mojo
+      - name: Test
+        run: target/mojo/test_brc
+      - name: Compare the output with the Rust version's on generated measurements
+        run: |
+          rustup toolchain install
+          cargo r --quiet --bin create_measurements --features=generate --release 1_000_000 measurements.txt 10000
+          cargo r --quiet --release measurements.txt > rust.out
+          target/mojo/brc measurements.txt > mojo.out
+          BRC_THREADS=1 target/mojo/brc measurements.txt > mojo-1.out
+          cmp rust.out mojo.out
+          cmp rust.out mojo-1.out
