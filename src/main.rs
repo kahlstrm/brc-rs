@@ -1,10 +1,9 @@
 #![feature(portable_simd)]
 use std::{
-    collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
-    ops::{Add, Range},
+    ops::Range,
     simd::{cmp::SimdPartialEq, u64x2, u8x16, ToBytes},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -22,40 +21,8 @@ struct WeatherStationStats {
     count: usize,
 }
 impl WeatherStationStats {
-    /// No measurements yet: any measurement replaces its min and max
-    const EMPTY: Self = WeatherStationStats {
-        min: i64::MAX,
-        max: i64::MIN,
-        sum: 0,
-        count: 0,
-    };
-    fn record(&mut self, measurement: i64) {
-        // new extremes get rare after a station's first rows, so branches beat loading and storing both always
-        if measurement < self.min {
-            std::hint::cold_path();
-            self.min = measurement;
-        }
-        if measurement > self.max {
-            std::hint::cold_path();
-            self.max = measurement;
-        }
-        self.sum += measurement;
-        self.count += 1;
-    }
     fn mean(&self) -> f64 {
         self.sum as f64 / 10.0 / self.count as f64
-    }
-}
-impl Add<&mut Self> for WeatherStationStats {
-    type Output = Self;
-
-    fn add(self, rhs: &mut Self) -> Self::Output {
-        WeatherStationStats {
-            min: self.min.min(rhs.min),
-            max: self.max.max(rhs.max),
-            sum: self.sum + rhs.sum,
-            count: self.count + rhs.count,
-        }
     }
 }
 /// A row's loads end within a line of its start, so read buffers keep a line of padding after the data:
@@ -236,43 +203,87 @@ fn calc(file_name: Option<String>) -> String {
                             (&f).take(lines.end - lines.start),
                         );
                     }
-                    stations.into_stations()
+                    stations
                 })
             })
             .collect::<Vec<_>>();
-        let mut stations = BTreeMap::new();
-        for h in handles {
-            let stations_välipala = h.join().unwrap();
-            for (k, v) in stations_välipala {
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .reduce(|mut stations, stations_välipala| {
+                stations.merge(&stations_välipala);
                 stations
-                    .entry(k)
-                    .and_modify(|jutska| *jutska = v + jutska)
-                    .or_insert(v);
-            }
-        }
-        stations
-    });
-    String::from("{")
-        + &stations
-            .iter()
-            .map(|(station, stats)| {
-                format!(
-                    "{}={:.1}/{:.1}/{:.1}",
-                    String::from_utf8_lossy(station),
-                    stats.min as f64 / 10.0,
-                    stats.mean(),
-                    stats.max as f64 / 10.0
-                )
             })
-            .collect::<Vec<_>>()
-            .join(", ")
-        + &String::from("}\n")
+            .unwrap_or_else(StationTable::new)
+    });
+    let mut output = vec![b'{'];
+    for (i, station) in stations.sorted_stations().iter().enumerate() {
+        if i > 0 {
+            output.extend_from_slice(b", ");
+        }
+        station.write_name(&mut output);
+        output.push(b'=');
+        write_tenths(
+            &mut output,
+            station.stats.min < 0,
+            station.stats.min.unsigned_abs(),
+        );
+        output.push(b'/');
+        let (negative, mean) = round_to_tenths(station.stats.mean());
+        write_tenths(&mut output, negative, mean);
+        output.push(b'/');
+        write_tenths(
+            &mut output,
+            station.stats.max < 0,
+            station.stats.max.unsigned_abs(),
+        );
+    }
+    output.extend_from_slice(b"}\n");
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Writes `tenths` as a decimal with one fractional digit, as `{:.1}` writes the number it is the tenths of
+fn write_tenths(output: &mut Vec<u8>, negative: bool, tenths: u64) {
+    if negative {
+        output.push(b'-');
+    }
+    let whole = tenths / 10;
+    let digits = whole.checked_ilog10().unwrap_or(0) + 1;
+    output.extend(
+        (0..digits)
+            .rev()
+            .map(|i| b'0' + (whole / 10u64.pow(i) % 10) as u8),
+    );
+    output.extend_from_slice(&[b'.', b'0' + (tenths % 10) as u8]);
+}
+
+/// Whether `value` is negative and its magnitude in tenths, rounded as `{:.1}` rounds it: its exact binary value
+/// to the nearest tenth, ties to even. Exact rather than through `value * 10.0`, whose own rounding may tip it over
+/// a half. `value` must be below 2^52 in magnitude, which a mean of temperatures always is
+fn round_to_tenths(value: f64) -> (bool, u64) {
+    let bits = value.to_bits();
+    let biased_exponent = (bits >> 52 & 0x7FF) as i64;
+    let mantissa = bits & ((1 << 52) - 1) | ((biased_exponent != 0) as u64) << 52;
+    // value = mantissa * 2^-shift; past 64, ten times the mantissa, below 2^57, is under half of 2^-shift
+    let shift = 1075 - biased_exponent.max(1);
+    assert!(shift > 0, "{value} is not below 2^52 in magnitude");
+    let shift = shift.min(64) as u32;
+    let scaled = 10 * mantissa as u128;
+    let truncated = scaled >> shift;
+    let remainder = scaled - (truncated << shift);
+    let half = 1 << (shift - 1);
+    let rounds_up = remainder > half || remainder == half && truncated & 1 == 1;
+    (
+        value.is_sign_negative(),
+        (truncated + rounds_up as u128) as u64,
+    )
 }
 
 /// Bytes of a station name stored inline in its slot and compared as two words
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
-/// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
-const TABLE_SIZE: usize = 1 << 16;
+/// A power of two, leaving a low load factor for the 10,000 stations the challenge allows. 4 MiB, which measured fastest:
+/// smaller tables collide more, and bigger ones were slower too
+const TABLE_SIZE: usize = 1 << 17;
 /// Slot of the name with the key words `key`
 fn slot_index(key: [u64; 2]) -> usize {
     const K: u64 = 0x517c_c1b7_2722_0a95;
@@ -330,16 +341,80 @@ fn long_tails_match<const N: usize>(stored: &[u8], tail: &LongTail<N>, tail_len:
     differing == u8x16::splat(0)
 }
 
-/// One cache line per station, so a lookup and its update touch a single line
-#[repr(align(64))]
+/// Half a cache line per station, so that a lookup and its update touch a single line, and twice as many slots fit
+/// in the memory of a table
+#[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
 struct Slot {
+    /// A short name's bytes and the ';' after it, or a long name's first 8 bytes and its `LONG_NAME_TAG` word
     key: [u64; 2],
-    /// Zero marks an empty slot, as station names are at least one byte long
-    len: usize,
-    /// Where a name of at least 16 bytes starts in `StationTable::long_names`
-    long_name_offset: usize,
-    stats: WeatherStationStats,
+    /// Zero marks an empty slot: a station is recorded as soon as it claims one. 32 bits are enough for a billion
+    /// rows
+    count: u32,
+    min: i16,
+    max: i16,
+    sum: i64,
+}
+const _: () = assert!(size_of::<Slot>() == 32);
+impl Slot {
+    /// No measurements yet: any measurement replaces its min and max
+    fn claimed(key: [u64; 2]) -> Self {
+        Slot {
+            key,
+            sum: 0,
+            count: 0,
+            min: i16::MAX,
+            max: i16::MIN,
+        }
+    }
+    fn record(&mut self, measurement: i64) {
+        let value = measurement as i16;
+        // new extremes get rare after a station's first rows, so branches beat loading and storing both always
+        if value < self.min {
+            std::hint::cold_path();
+            self.min = value;
+        }
+        if value > self.max {
+            std::hint::cold_path();
+            self.max = value;
+        }
+        self.sum += measurement;
+        self.count += 1;
+    }
+    fn stats(&self) -> WeatherStationStats {
+        WeatherStationStats {
+            min: self.min.into(),
+            max: self.max.into(),
+            sum: self.sum,
+            count: self.count as usize,
+        }
+    }
+    fn add(&mut self, other: &Slot) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
+    }
+    fn is_long(&self) -> bool {
+        self.key[1] & LONG_NAME_TAG == LONG_NAME_TAG
+    }
+    fn name_len(&self) -> usize {
+        if self.is_long() {
+            (self.key[1] >> 32 & 0xFF) as usize
+        } else {
+            let bytes = self.key.iter().flat_map(|word| word.to_le_bytes());
+            bytes.take_while(|&byte| byte != b';').count()
+        }
+    }
+}
+
+/// In the second key word of the slot of a name of at least 16 bytes, above its length and where it starts in
+/// `StationTable::long_names`: UTF-8 has no 0xFF byte, so no short name's key has it
+const LONG_NAME_TAG: u64 = 0xFF << 56;
+
+/// Where the name of at least 16 bytes with the second key word `tagged` starts in `StationTable::long_names`
+fn long_name_offset(tagged: u64) -> usize {
+    (tagged & 0xFFFF_FFFF) as usize
 }
 
 /// Open-addressing table with linear probing, keyed by station name
@@ -360,25 +435,20 @@ impl StationTable {
         }
     }
 
-    /// Finds the slot of the name shorter than the inline key with `key` and `len`, claiming an empty one for
-    /// a new name. The key alone tells such names apart, as it holds the ';' after the name
+    /// Finds the slot of the name shorter than the inline key with `key`, claiming an empty one for a new name.
+    /// The key alone tells such names apart, as it holds the ';' after the name
     #[inline(always)]
-    fn find_short_slot(&mut self, key: [u64; 2], len: usize) -> &mut Slot {
+    fn find_short_slot(&mut self, key: [u64; 2]) -> &mut Slot {
         let mut i = slot_index(key);
         loop {
             let slot = &self.slots[i];
-            // compared word by word: comparing the arrays at once compiles to a 16-byte load of the key
-            // just stored as two words, which stalls as the stores can't be forwarded to it
-            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) == 0 {
+            // compared at once, with a single 16-byte load: in 64-byte slots, whose key followed the stats, that load
+            // stalled behind the stores to them, while word by word it did not
+            if slot.key == key {
                 return &mut self.slots[i];
             }
-            if slot.len == 0 {
-                self.slots[i] = Slot {
-                    key,
-                    len,
-                    long_name_offset: 0,
-                    stats: WeatherStationStats::EMPTY,
-                };
+            if slot.count == 0 {
+                self.slots[i] = Slot::claimed(key);
                 return &mut self.slots[i];
             }
             i = (i + 1) % TABLE_SIZE;
@@ -387,7 +457,9 @@ impl StationTable {
 
     /// Finds the slot of the name of `len` bytes, at least 16, whose first 16 bytes are `key`, with `tail` after
     /// them up to its end, claiming an empty one for a new name. Hashed by all its bytes, see
-    /// `long_name_slot_index`. Of a stored name of the same length, only the bytes `tail` keeps are compared
+    /// `long_name_slot_index`. Its slot keeps its first 8 bytes and, in place of the next 8, its length and where
+    /// it is stored. Of a stored name of the same length, its bytes from the 8th up to the end `tail` keeps are
+    /// compared
     #[inline(always)]
     fn find_long_name_slot<const N: usize>(
         &mut self,
@@ -395,27 +467,25 @@ impl StationTable {
         len: usize,
         tail: &LongTail<N>,
     ) -> &mut Slot {
+        let tag = LONG_NAME_TAG | (len as u64) << 32;
         let mut i = long_name_slot_index(key, tail);
         loop {
             let slot = &self.slots[i];
-            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ key[1]) | (slot.len ^ len) as u64 == 0
-                && long_tails_match(
-                    &self.long_names[slot.long_name_offset + INLINE_KEY_LEN..]
-                        [..N * INLINE_KEY_LEN],
-                    tail,
-                    len - INLINE_KEY_LEN,
-                )
-            {
-                return &mut self.slots[i];
+            if (slot.key[0] ^ key[0]) | (slot.key[1] ^ tag) >> 32 == 0 {
+                let stored = &self.long_names[long_name_offset(slot.key[1]) + 8..];
+                if load_u64(stored, 0) == key[1]
+                    && long_tails_match(
+                        &stored[8..][..N * INLINE_KEY_LEN],
+                        tail,
+                        len - INLINE_KEY_LEN,
+                    )
+                {
+                    return &mut self.slots[i];
+                }
             }
-            if slot.len == 0 {
+            if slot.count == 0 {
                 let offset = self.long_names.len() - LONG_TAIL_LEN;
-                self.slots[i] = Slot {
-                    key,
-                    len,
-                    long_name_offset: offset,
-                    stats: WeatherStationStats::EMPTY,
-                };
+                self.slots[i] = Slot::claimed([key[0], tag | offset as u64]);
                 let key_bytes = key.iter().flat_map(|word| word.to_le_bytes());
                 let tail_bytes = tail.iter().flat_map(|chunk| chunk.to_array());
                 // the chunks whole, cut at the name's end after: taking `len` bytes copies them one at a time
@@ -429,23 +499,93 @@ impl StationTable {
         }
     }
 
-    fn into_stations(self) -> Vec<(Vec<u8>, WeatherStationStats)> {
-        self.slots
-            .iter()
-            .filter(|slot| slot.len != 0)
+    fn occupied_slots(&self) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().filter(|slot| slot.count != 0)
+    }
+
+    /// The first 16 bytes of the name in `slot`, which a long name's slot keeps only the first 8 of
+    fn name_key(&self, slot: &Slot) -> [u64; 2] {
+        if slot.is_long() {
+            let stored = &self.long_names[long_name_offset(slot.key[1])..];
+            [slot.key[0], load_u64(stored, 8)]
+        } else {
+            slot.key
+        }
+    }
+
+    /// The tail of the long name in `slot` as `parse_long_name::<N>` returns it, zero past the name
+    fn stored_tail<const N: usize>(&self, slot: &Slot) -> LongTail<N> {
+        let stored = &self.long_names[long_name_offset(slot.key[1]) + INLINE_KEY_LEN..];
+        let masks = tail_masks::<N>(slot.name_len() - INLINE_KEY_LEN);
+        std::array::from_fn(|i| u8x16::from_slice(&stored[i * INLINE_KEY_LEN..]) & masks[i])
+    }
+
+    /// Adds the stations of `other` to this table's, finding each as a row of its name would.
+    /// Long names take the same number of chunks as in `record_long_row`, which their slot depends on
+    fn merge(&mut self, other: &StationTable) {
+        for slot in other.occupied_slots() {
+            let (key, len) = (other.name_key(slot), slot.name_len());
+            let merged = if len < INLINE_KEY_LEN {
+                self.find_short_slot(key)
+            } else if len < 2 * INLINE_KEY_LEN {
+                self.find_long_name_slot(key, len, &other.stored_tail::<1>(slot))
+            } else {
+                let tail = other.stored_tail::<{ LONG_TAIL_LEN / INLINE_KEY_LEN }>(slot);
+                self.find_long_name_slot(key, len, &tail)
+            };
+            merged.add(slot);
+        }
+    }
+
+    /// The stations sorted by name. Sorted by their first 16 bytes as a number, which tells nearly all names
+    /// apart without reaching for the bytes of long names
+    fn sorted_stations(&self) -> Vec<Station<'_>> {
+        let mut stations: Vec<_> = self
+            .occupied_slots()
             .map(|slot| {
-                let name = if slot.len < INLINE_KEY_LEN {
-                    slot.key
-                        .iter()
-                        .flat_map(|word| word.to_le_bytes())
-                        .take(slot.len)
-                        .collect()
+                let [low, high] = self.name_key(slot);
+                let key = u128::from(low) | u128::from(high) << 64;
+                let len = slot.name_len();
+                let (prefix, long_name) = if len < INLINE_KEY_LEN {
+                    // without the ';' after the name, so that a name sorts before those it is the start of
+                    (key & !(u128::MAX << (8 * len)), &[][..])
                 } else {
-                    self.long_names[slot.long_name_offset..][..slot.len].to_vec()
+                    (
+                        key,
+                        &self.long_names[long_name_offset(slot.key[1])..][..len],
+                    )
                 };
-                (name, slot.stats)
+                Station {
+                    prefix: prefix.swap_bytes(),
+                    long_name,
+                    len,
+                    stats: slot.stats(),
+                }
             })
-            .collect()
+            .collect();
+        stations.sort_unstable_by(|a, b| {
+            (a.prefix, a.long_name, a.len).cmp(&(b.prefix, b.long_name, b.len))
+        });
+        stations
+    }
+}
+
+/// A station of `StationTable::sorted_stations`
+struct Station<'a> {
+    /// The name's first 16 bytes, zero past a shorter name, as a big-endian number
+    prefix: u128,
+    /// The whole name if it is at least 16 bytes long, empty otherwise
+    long_name: &'a [u8],
+    len: usize,
+    stats: WeatherStationStats,
+}
+impl Station<'_> {
+    fn write_name(&self, output: &mut Vec<u8>) {
+        if self.long_name.is_empty() {
+            output.extend_from_slice(&self.prefix.to_be_bytes()[..self.len]);
+        } else {
+            output.extend_from_slice(self.long_name);
+        }
     }
 }
 
@@ -476,7 +616,7 @@ fn record_named_row(
     // only right for a name shorter than 16 bytes
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     if len < INLINE_KEY_LEN {
-        stations.find_short_slot(key, len).stats.record(measurement);
+        stations.find_short_slot(key).record(measurement);
         start + len + 1 + temperature_len
     } else {
         record_long_row(buf, stations, start)
@@ -511,7 +651,6 @@ fn record_long_name_row<const N: usize>(
     let (measurement, temperature_len) = parse_temperature(load_u64(buf, start + len + 1));
     stations
         .find_long_name_slot(key, len, tail)
-        .stats
         .record(measurement);
     start + len + 1 + temperature_len
 }
@@ -601,9 +740,11 @@ mod tests {
     use crate::parse_name;
     use crate::parse_temperature;
     use crate::record_row;
+    use crate::round_to_tenths;
     use crate::slot_index;
     use crate::split_lines;
     use crate::thread_count;
+    use crate::write_tenths;
     use crate::ChunkQueue;
     use crate::StationTable;
     use crate::WeatherStationStats;
@@ -622,11 +763,22 @@ mod tests {
     fn thread_count_rejects_zero() {
         thread_count(Some("0".into()), 8);
     }
+    /// The stations of `stations` sorted by name, each with its name
+    fn named_stations(stations: &StationTable) -> Vec<(Vec<u8>, WeatherStationStats)> {
+        let sorted = stations.sorted_stations();
+        let named = sorted.iter().map(|station| {
+            let mut name = Vec::new();
+            station.write_name(&mut name);
+            (name, station.stats)
+        });
+        named.collect()
+    }
+
     /// Records the first line of `buf`, returning its station name, measurement and length
     fn record_first_row(buf: &[u8]) -> (Vec<u8>, i64, usize) {
         let mut stations = StationTable::new();
         let line_len = record_row(buf, &mut stations, 0);
-        let [(name, stats)] = stations.into_stations().try_into().unwrap();
+        let [(name, stats)] = named_stations(&stations).try_into().unwrap();
         (name, stats.sum, line_len)
     }
 
@@ -743,6 +895,88 @@ mod tests {
         }
     }
 
+    /// `value` as `write_tenths` writes it after `round_to_tenths`
+    fn tenths_text(value: f64) -> String {
+        let (negative, tenths) = round_to_tenths(value);
+        let mut output = Vec::new();
+        write_tenths(&mut output, negative, tenths);
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn round_to_tenths_writes_means_as_formatting_does() {
+        // exact halves, such as 5 / 10 / 2, and values just off them
+        for count in 1..=200 {
+            for sum in -2_000i64..=2_000 {
+                let mean = WeatherStationStats {
+                    min: 0,
+                    max: 0,
+                    sum,
+                    count,
+                }
+                .mean();
+                assert_eq!(tenths_text(mean), format!("{mean:.1}"), "{sum} / {count}");
+            }
+        }
+        for value in [
+            0.0, -0.0, 0.05, -0.05, 0.25, -0.25, 99.95, -99.95, 1e-300, -1e-300, 5e-324,
+        ] {
+            assert_eq!(tenths_text(value), format!("{value:.1}"), "{value:e}");
+        }
+    }
+
+    #[test]
+    fn merge_matches_recording_every_row_into_one_table() {
+        let data = std::fs::read("samples/measurements-10000-unique-keys.txt").unwrap();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let record = |range: std::ops::Range<usize>| {
+            let mut stations = StationTable::new();
+            let mut start = range.start;
+            while start < range.end {
+                start = record_row(&buf, &mut stations, start);
+            }
+            stations
+        };
+        let half = data.len() / 2;
+        let middle = half + data[half..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        let mut merged = record(0..middle);
+        merged.merge(&record(middle..data.len()));
+        merged.merge(&record(0..middle));
+        let mut expected = record(0..data.len());
+        expected.merge(&record(0..middle));
+        assert_eq!(named_stations(&merged), named_stations(&expected));
+    }
+
+    #[test]
+    fn sorted_stations_sorts_names_by_their_bytes() {
+        let names = [
+            "b",
+            "a",
+            "ab",
+            "a!",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaab",
+        ];
+        let data: Vec<u8> = names
+            .iter()
+            .flat_map(|name| format!("{name};1.0\n").into_bytes())
+            .collect();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let mut stations = StationTable::new();
+        let mut start = 0;
+        while start < data.len() {
+            start = record_row(&buf, &mut stations, start);
+        }
+        let mut expected: Vec<_> = names.map(|name| name.as_bytes().to_vec()).into();
+        expected.sort();
+        let sorted: Vec<_> = named_stations(&stations)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(sorted, expected);
+    }
+
     #[test]
     fn slot_index_separates_equal_changes_to_both_key_words() {
         let index = |name: &[u8]| slot_index(key_of(name));
@@ -766,9 +1000,7 @@ mod tests {
         let mut stations = StationTable::new();
         let (starts, ends) = split_lines::<K>(buf, until);
         let consumed = parse_lanes(buf, &mut stations, starts, ends)[K - 1];
-        let mut result = stations.into_stations();
-        result.sort_by(|a, b| a.0.cmp(&b.0));
-        (result, consumed)
+        (named_stations(&stations), consumed)
     }
 
     #[test]
@@ -782,8 +1014,7 @@ mod tests {
         while consumed < until {
             consumed = record_row(&buf, &mut stations, consumed);
         }
-        let mut expected = stations.into_stations();
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = named_stations(&stations);
         assert_eq!(
             parse_in_lanes::<1>(&buf, until),
             (expected.clone(), consumed)
@@ -805,8 +1036,7 @@ mod tests {
         while consumed < data.len() {
             consumed = record_row(&buf, &mut stations, consumed);
         }
-        let mut expected = stations.into_stations();
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = named_stations(&stations);
         assert_eq!(
             parse_in_lanes::<2>(&buf, data.len()),
             (expected.clone(), consumed)
@@ -932,14 +1162,38 @@ mod tests {
         while start < data.len() {
             start = record_row(&buf, &mut stations, start);
         }
-        let mut recorded: Vec<_> = stations
-            .into_stations()
+        let recorded: Vec<_> = named_stations(&stations)
             .into_iter()
             .map(|(name, stats)| (name, stats.min, stats.max, stats.count))
             .collect();
-        recorded.sort();
         let mut expected: Vec<_> = names.into_iter().map(|name| (name, -20, 10, 2)).collect();
         expected.sort();
         assert_eq!(recorded, expected);
+    }
+
+    #[test]
+    fn long_names_differing_only_in_their_second_8_bytes_get_a_slot_each() {
+        // enough names that their probes pass over one another's slots, whose keys keep only the first 8 bytes
+        let names: Vec<Vec<u8>> = (0..10_000)
+            .map(|i| format!("{}{i:08}{}", "p".repeat(8), "s".repeat(4)).into_bytes())
+            .collect();
+        let data: Vec<u8> = names
+            .iter()
+            .flat_map(|name| [name, &b";1.0\n"[..]].concat())
+            .collect();
+        let buf = [&data[..], &[0; PADDING]].concat();
+        let mut stations = StationTable::new();
+        let mut start = 0;
+        while start < data.len() {
+            start = record_row(&buf, &mut stations, start);
+        }
+        let recorded: Vec<_> = named_stations(&stations)
+            .into_iter()
+            .map(|(name, stats)| (name, stats.count))
+            .collect();
+        assert_eq!(
+            recorded,
+            names.into_iter().map(|name| (name, 1)).collect::<Vec<_>>()
+        );
     }
 }
