@@ -282,7 +282,7 @@ fn round_to_tenths(value: f64) -> (bool, u64) {
 /// Bytes of a station name stored inline in its slot and compared as two words
 const INLINE_KEY_LEN: usize = 2 * size_of::<u64>();
 /// A power of two, leaving a low load factor for the 10,000 stations the challenge allows
-const TABLE_SIZE: usize = 1 << 16;
+const TABLE_SIZE: usize = 1 << 17;
 /// Slot of the name with the key words `key`
 fn slot_index(key: [u64; 2]) -> usize {
     const K: u64 = 0x517c_c1b7_2722_0a95;
