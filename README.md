@@ -702,10 +702,12 @@ On the same machine, with both files in the page cache, the median of 15 runs of
 
 | Solution | 1B rows | 10K stations |
 | --- | --- | --- |
-| brc-rs | 0.664 s | 0.312 s |
-| Mojo port | 0.651 s | 0.309 s |
+| brc-rs | 0.674 s | 0.279 s |
+| Mojo port | 0.673 s | 0.308 s |
 
-The program runs one process per core. The first writes the bounds of the file's chunks into a pipe and starts the rest as copies of itself. Each process takes chunks from that pipe until it is empty, and the copies send their tables back to the first, which merges and prints them. Its row path mirrors the Rust one function for function. At about 790 lines against 550 it is longer, mostly because of the processes and pipes.
+The program runs one process per core. The first writes the bounds of the file's chunks into a pipe and starts the rest as copies of itself. Each process takes chunks from that pipe until it is empty, and the copies send their tables back to the first, which merges and prints them. Its row path mirrors the Rust one function for function. At about 790 lines against 730 it is longer, mostly because of the processes and pipes.
+
+On one core, the port is 2% faster than the Rust version on the billion rows, and 4% slower on the 10K set. Across all cores, every process also spends about 8 ms starting Mojo's runtime, and the stations travel back through pipes: on the 10K set, with 10,000 stations per process, that is the other two thirds of the gap.
 
 ### How the port went
 
@@ -713,10 +715,10 @@ A straight translation was 1.5× slower on one core: 0.374 s against 0.251 s on 
 
 - **Bounds checks were most of the gap.** A failed check in Mojo's standard library may return, and it takes the bounds by reference, so LLVM keeps them in memory and drops no later check. Checking each 128-byte row once in a helper that calls `abort()`, which never returns, and stopping lanes at unsigned bounds clamped to the buffer's length, leaves the row loads with no checks, as in Rust.
 - **Register pressure came next.** The fixes were masks kept right after the read buffer's data instead of in a `comptime` table, which got copied to the stack on every use, and `likely`/`unlikely` hints on the rare paths, with which four lanes beat three.
-- **Smaller slots helped the 10K set.** Slots are 32 bytes, with 16-bit minimums and maximums. A long name's slot keeps its length and offset in its second 8 bytes, tagged with a 0xFF byte that UTF-8 never has.
-- **Parallelism took the longest.** Equal chunks per process left some up to 45 ms behind the others, and every process spends about 8 ms starting Mojo's runtime. Chunks that shrink towards the end, taken from the shared pipe, fixed the first and mostly hide the second. Two standard-library bugs got in the way: `Process.run` garbles short arguments built at run time, so workers get their job through an environment variable; and a `Pipe` closes after its last use, so the chunk queue closed before the workers had read it.
+- **Smaller slots helped the 10K set.** Slots are 32 bytes, with 16-bit minimums and maximums. A long name's slot keeps its length and offset in its second 8 bytes, tagged with a 0xFF byte that UTF-8 never has. The Rust version took the same layout later, and with it twice as many slots, which the port then adopted as well.
+- **Parallelism took the longest.** Equal chunks per process left some up to 45 ms behind the others, and every process spends about 8 ms starting Mojo's runtime. Chunks that shrink towards the end, taken from the shared pipe, fixed the first and hide part of the second. Two standard-library bugs got in the way: `Process.run` garbles short arguments built at run time, so workers get their job through an environment variable; and a `Pipe` closes after its last use, so the chunk queue closed before the workers had read it.
 
-In the end the port went from 0.889 s to 0.651 s on the billion rows, and from 0.370 s to 0.309 s on the 10K set.
+In the end the port matches the Rust version on the billion rows, and comes within 10% of it on the 10K set.
 
 What didn't work: parsing a batch of rows before looking any of them up, a separate table for long names, smaller tables, inlining the long names' path, and more processes than cores.
 

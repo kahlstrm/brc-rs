@@ -17,8 +17,9 @@ comptime PADDING = MAX_LINE_LEN
 every row starting within it can be loaded without checking where the data ends."""
 comptime LONG_TAIL_LEN = 6 * INLINE_KEY_LEN
 """Bytes of a station name past its first 16, which the challenge caps at 100 bytes, rounded up to 16."""
-comptime TABLE_SIZE = 1 << 16
-"""A power of two, leaving a low load factor for the 10,000 stations the challenge allows."""
+comptime TABLE_SIZE = 1 << 17
+"""A power of two, leaving a low load factor for the 10,000 stations the challenge allows. 4 MiB, as in the Rust
+version, where that measured fastest."""
 comptime CHUNK_SIZE = 1 << 19
 """Bytes per `read`."""
 comptime LANES = 4
