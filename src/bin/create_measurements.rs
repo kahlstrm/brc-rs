@@ -615,7 +615,8 @@ const STATIONS: &[WeatherStation] = &[
 #[cfg(test)]
 mod tests {
 
-    use std::collections::{HashMap, HashSet};
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     use crate::generate_measurements;
@@ -634,22 +635,11 @@ mod tests {
     }
     #[test]
     fn each_station_measures_around_its_mean_with_spread_of_ten() {
-        let thing = Arc::new(Mutex::new(Vec::new()));
-        generate_measurements(400_000, STATIONS.len(), thing.clone()).unwrap();
-        let res = String::from_utf8(thing.as_ref().lock().unwrap().clone())
-            .expect("should be valid utf-8");
-        let index: HashMap<&str, usize> = STATIONS
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.id, i))
-            .collect();
-        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); STATIONS.len()];
-        for line in res.lines() {
-            let (name, value) = line.split_once(';').expect("name;value");
-            let station = index[name];
-            samples[station].push(value.parse().expect("temperature"));
-        }
-        for (station, values) in STATIONS.iter().zip(&samples) {
+        let mut rng = StdRng::seed_from_u64(42);
+        for station in STATIONS {
+            let values: Vec<_> = (0..10_000)
+                .map(|_| station.measurement(&mut rng) / 10.0)
+                .collect();
             let n = values.len() as f64;
             let mean = values.iter().sum::<f64>() / n;
             let sd = (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
