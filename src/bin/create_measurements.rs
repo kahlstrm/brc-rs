@@ -14,12 +14,34 @@ struct WeatherStation {
 }
 
 impl WeatherStation {
-    fn measurement(&self) -> f64 {
+    /// A measurement in tenths of a degree
+    fn measurement(&self, rng: &mut impl Rng) -> f64 {
         let normal_dist = Normal::new(self.mean_temperature, 10.0).unwrap();
-        let mut rng = rng();
-        let measurement = normal_dist.sample(&mut rng);
-        (measurement * 10.0).round() / 10.0
+        (normal_dist.sample(rng) * 10.0).round()
     }
+}
+
+/// Appends a temperature given in tenths of a degree as `{:.1}` prints it, e.g. `-3` as `-0.3` and
+/// `-0.0` (from a small negative measurement) as `-0.0`
+fn push_tenths(out: &mut Vec<u8>, tenths: f64) {
+    if tenths.is_sign_negative() {
+        out.push(b'-');
+    }
+    let magnitude = tenths.abs() as u64;
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    let mut whole = magnitude / 10;
+    loop {
+        digits[len] = b'0' + (whole % 10) as u8;
+        len += 1;
+        whole /= 10;
+        if whole == 0 {
+            break;
+        }
+    }
+    out.extend(digits[..len].iter().rev());
+    out.push(b'.');
+    out.push(b'0' + (magnitude % 10) as u8);
 }
 
 fn main() -> std::io::Result<()> {
@@ -148,19 +170,20 @@ fn create_measurements<W: Write + Send>(
     stations: Arc<[(String, &'static WeatherStation)]>,
     write_mutex: Arc<Mutex<W>>,
 ) -> std::io::Result<()> {
+    let mut rng = rng();
     let mut tmp_res = Vec::with_capacity(TMP_VEC_CAPACITY);
-    let mut tmp_line = Vec::with_capacity(106);
 
     for _ in 0..count {
-        let (name, station) = &stations[rng().random_range(0..stations.len())];
+        let (name, station) = &stations[rng.random_range(0..stations.len())];
 
-        writeln!(tmp_line, "{};{:.1}", name, station.measurement())?;
-        if tmp_line.len() + tmp_res.len() > TMP_VEC_CAPACITY {
+        tmp_res.extend_from_slice(name.as_bytes());
+        tmp_res.push(b';');
+        push_tenths(&mut tmp_res, station.measurement(&mut rng));
+        tmp_res.push(b'\n');
+        if tmp_res.len() > TMP_VEC_CAPACITY {
             write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
             tmp_res.clear();
         }
-        tmp_res.write_all(&tmp_line)?;
-        tmp_line.clear();
     }
     write_mutex.lock().as_mut().unwrap().write_all(&tmp_res)?;
     Ok(())
@@ -596,6 +619,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::generate_measurements;
+    use crate::push_tenths;
     use crate::stations;
     use crate::MAX_STATIONS;
     use crate::STATIONS;
@@ -636,6 +660,15 @@ mod tests {
                 station.mean_temperature
             );
             assert!((9.0..=11.0).contains(&sd), "{}: sd {sd:.2}", station.id);
+        }
+    }
+    #[test]
+    fn tenths_are_pushed_as_one_decimal_formatting_prints_them() {
+        let tenths = (-1_000..=1_000).map(f64::from).chain([-0.0]);
+        for tenth in tenths {
+            let mut out = Vec::new();
+            push_tenths(&mut out, tenth);
+            assert_eq!(out, format!("{:.1}", tenth / 10.0).into_bytes(), "{tenth}");
         }
     }
     #[test]
