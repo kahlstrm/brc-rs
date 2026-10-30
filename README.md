@@ -634,7 +634,7 @@ Each thread used to get one equal part of the file. Equal parts didn't take equa
 Now the threads claim 4 MiB chunks from a shared atomic offset until the whole file is claimed, so the threads that are ahead take the last chunks, and all of them finish within about 3 ms of each other.
 A line belongs to the chunk it starts in, and each thread keeps one table and one read buffer for all of its chunks. Both datasets got about 3% faster.
 
-Finishing threads merge their tables with any table waiting in a shared slot, outside the slot's lock, so merging overlaps with workers still reading. The worker count is capped at the number of file chunks to avoid allocating and merging idle workers' tables on small inputs. The results are written out from integer tenths, rounded exactly as formatting the floats would. With its 10,000 stations to merge and write, the integer output formatting made the 10K dataset 4% faster.
+At the end, the threads' tables are merged into the first one, and the results are written out from integer tenths, rounded exactly as formatting the floats would. With its 10,000 stations to merge and write, that made the 10K dataset 4% faster.
 
 ### Half-size slots
 
