@@ -177,6 +177,12 @@ fn line_start_from(mut f: impl Read + Seek, at: u64, file_len: u64) -> u64 {
     at - 1 + read as u64
 }
 
+/// Avoid allocating and merging tables for workers that cannot claim a chunk.
+fn worker_count(thread_count: usize, file_len: u64, chunk_len: u64) -> usize {
+    let chunks = usize::try_from(file_len.div_ceil(chunk_len.max(1))).unwrap_or(usize::MAX);
+    thread_count.min(chunks).max(1)
+}
+
 fn calc(file_name: Option<String>) -> String {
     let file_name = file_name.unwrap_or("measurements.txt".into());
     let file_len = File::open(&file_name).unwrap().metadata().unwrap().len();
@@ -188,7 +194,7 @@ fn calc(file_name: Option<String>) -> String {
     );
     let queue = ChunkQueue::new(file_len, CHUNK_LEN);
     let stations = thread::scope(|s| {
-        let handles = (0..thread_count)
+        let handles = (0..worker_count(thread_count, file_len, CHUNK_LEN))
             .map(|_| {
                 let (file_name, queue) = (&file_name, &queue);
                 s.spawn(move || {
@@ -732,6 +738,21 @@ fn aggregate_measurements(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn worker_count_caps_workers_at_the_chunk_count() {
+        for (threads, bytes, chunk, expected) in [
+            (8, 0, 4, 1),
+            (8, 1, 4, 1),
+            (8, 4, 4, 1),
+            (8, 5, 4, 2),
+            (8, 32, 4, 8),
+            (8, 33, 4, 8),
+            (1, 33, 4, 1),
+        ] {
+            assert_eq!(super::worker_count(threads, bytes, chunk), expected);
+        }
+    }
 
     use crate::calc;
     use crate::long_name_slot_index;
