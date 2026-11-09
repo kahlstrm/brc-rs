@@ -671,7 +671,7 @@ On the same machine, with the file in the page cache, against native-image build
 | [jerrinot](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_jerrinot.java) | 0.81 s | 0.47 s |
 | [artsiomkorzun](https://github.com/gunnarmorling/1brc/blob/main/src/main/java/dev/morling/onebrc/CalculateAverage_artsiomkorzun.java) | 0.83 s | 0.49 s |
 
-Not bad for safe Rust without dependencies. The comparison is not quite the original challenge's, though: there the file sat on a RAM disk, where the `mmap` solutions and their worker-exit trick have more to gain, as described above.
+Not bad for safe Rust without dependencies. The original challenge read the file from a RAM disk rather than the page cache, but that doesn't change the picture: with the 1B file on a tmpfs, every program here got up to 10% slower, or about as fast with huge pages, and the order stayed the same. The 10K file was on one all along.
 
 ## Conclusion, Part 2
 
