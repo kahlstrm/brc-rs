@@ -153,13 +153,58 @@ impl ChunkQueue {
         let start = self.next.fetch_add(self.chunk_len, Ordering::Relaxed);
         (start < self.file_len).then(|| start..(start + self.chunk_len).min(self.file_len))
     }
-    /// The lines starting within the next unclaimed range, `None` when the file is all claimed. Empty if no line
-    /// starts within the range: the line it is in belongs to the range before
-    fn claim_lines(&self, mut f: impl Read + Seek) -> Option<Range<u64>> {
-        let claimed = self.claim()?;
+    /// The lines starting within `claimed`. Empty if no line starts within it: the line it is in belongs to the
+    /// range before
+    fn lines_in(&self, claimed: Range<u64>, mut f: impl Read + Seek) -> Range<u64> {
         let start = line_start_from(&mut f, claimed.start, self.file_len);
         let end = line_start_from(&mut f, claimed.end, self.file_len);
-        Some(start..end)
+        start..end
+    }
+    /// The chunk `READ_AHEAD` bytes past `claimed`, which threads will claim soon, `None` if the file ends before it
+    fn ahead_of(&self, claimed: &Range<u64>) -> Option<Range<u64>> {
+        let start = claimed.start.saturating_add(READ_AHEAD);
+        (start < self.file_len)
+            .then(|| start..start.saturating_add(self.chunk_len).min(self.file_len))
+    }
+}
+
+/// How far past each claimed chunk's start the OS is asked to read the file ahead of the threads. Measured on a
+/// 16 GB M1 Pro, whose page cache can't hold the 13.8 GB file: threads blocking on reads left the SSD idle while
+/// they parsed, taking ~4.8 s; hinting the chunk 32 MiB (8 threads × `CHUNK_LEN`) ahead took ~2.4 s, as long as
+/// `dd` takes to read the file
+const READ_AHEAD: u64 = 8 * CHUNK_LEN;
+
+/// Asks the OS to start reading `range` of `f` into the page cache, so that a later read doesn't wait on the disk
+#[cfg(target_os = "macos")]
+fn advise_will_need(f: &File, range: Range<u64>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let invalid = |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+    let advice = libc::radvisory {
+        ra_offset: libc::off_t::try_from(range.start).map_err(invalid)?,
+        ra_count: libc::c_int::try_from(range.end - range.start).map_err(invalid)?,
+    };
+    // SAFETY: F_RDADVISE only reads the `radvisory` it is given, which outlives the call
+    match unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &advice) } {
+        -1 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// Elsewhere, reading ahead is left to the OS: on Linux, `posix_fadvise(WILLNEED)` on the same chunks made no
+/// difference with the file read from disk, as its readahead of each thread's sequential reads already keeps the
+/// disk busy
+#[cfg(not(target_os = "macos"))]
+fn advise_will_need(_: &File, _: Range<u64>) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Hints that `range` of `f` will be read soon. A failed hint costs only speed, so it is reported once, not fatal
+fn read_ahead(f: &File, range: Range<u64>) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    if let Err(e) = advise_will_need(f, range.clone()) {
+        REPORTED.call_once(|| {
+            eprintln!("brc-rs: reading {range:?} ahead failed, continuing without: {e}")
+        });
     }
 }
 
@@ -201,7 +246,11 @@ fn calc(file_name: Option<String>) -> String {
                     let f = File::open(file_name).unwrap();
                     let mut stations = StationTable::new();
                     let mut buf = [0; CHUNK_SIZE + PADDING];
-                    while let Some(lines) = queue.claim_lines(&f) {
+                    while let Some(claimed) = queue.claim() {
+                        if let Some(ahead) = queue.ahead_of(&claimed) {
+                            read_ahead(&f, ahead);
+                        }
+                        let lines = queue.lines_in(claimed, &f);
                         (&f).seek(SeekFrom::Start(lines.start)).unwrap();
                         aggregate_measurements(
                             &mut stations,
@@ -1102,6 +1151,19 @@ mod tests {
     }
 
     #[test]
+    fn chunk_queue_reads_ahead_one_chunk_until_the_end_of_the_file() {
+        let chunk = super::CHUNK_LEN;
+        let ahead = super::READ_AHEAD;
+        let queue = ChunkQueue::new(ahead + chunk + 10, chunk);
+        assert_eq!(queue.ahead_of(&(0..chunk)), Some(ahead..ahead + chunk));
+        assert_eq!(
+            queue.ahead_of(&(chunk..2 * chunk)),
+            Some(ahead + chunk..ahead + chunk + 10)
+        );
+        assert_eq!(queue.ahead_of(&(chunk + 10..2 * chunk)), None);
+    }
+
+    #[test]
     fn chunk_queue_covers_the_file_with_line_ranges_claimed_from_any_threads() {
         let input: Vec<u8> = (0..50)
             .flat_map(|i| format!("{}{i};{i}.0\n", "s".repeat(i % 7)).into_bytes())
@@ -1122,7 +1184,8 @@ mod tests {
                     .map(|_| {
                         s.spawn(|| {
                             let mut f = std::io::Cursor::new(&input);
-                            std::iter::from_fn(|| queue.claim_lines(&mut f)).collect::<Vec<_>>()
+                            std::iter::from_fn(|| Some(queue.lines_in(queue.claim()?, &mut f)))
+                                .collect::<Vec<_>>()
                         })
                     })
                     .collect();

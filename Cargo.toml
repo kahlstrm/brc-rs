@@ -17,3 +17,7 @@ generate = ["rand", "rand_distr"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+# For `fcntl(F_RDADVISE)`, which reads the file ahead of the threads
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.177"
